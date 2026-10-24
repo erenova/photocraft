@@ -5670,8 +5670,9 @@ fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter, xf: &View
                 draw_smoothing_string(painter, xf, s);
             }
         }
-        // Quick Selection's live outline shows the stroke once its first segment has grown.
-        Tool::QuickSelection if crate::quick_select_ui::has_grown(app) => {}
+        // Quick Selection's live outline shows the stroke once its first segment has grown (the
+        // trail stays when View › Extras hides selection edges, so the drag still shows).
+        Tool::QuickSelection if crate::quick_select_ui::has_grown(app) && app.ui.view.shows(app.ui.view.show.selection_edges) => {}
         t if t.is_brushlike() || t == Tool::QuickSelection => {
             // Retouching strokes preview as a translucent trail of the brush footprint: a mask,
             // not a brush-wide egui polyline (which zoomed in tessellates into wedges, #189).

@@ -127,3 +127,22 @@ SOLVER width=256 n=65536 case=chain old_ms=[1.83223, 1.855307, 1.887005] new_ms=
 SOLVER width=256 n=65536 case=all-source old_ms=[1.075863, 1.0908529999999999, 1.178408] new_ms=[1.16852, 1.184938, 1.224871] speedup=0.92
 SOLVER width=256 n=65536 case=dense-grid old_ms=[33.334272999999996, 33.502357, 33.531151] new_ms=[4.31308, 4.609208, 4.618033] speedup=7.27
 ```
+
+## Live strokes while dragging (2026-10-24, #9145)
+
+Since #9145 the selection grows while the button is held: each batch of new points is one
+segment of the stroke (`photocraft_engine::quick_stroke`), grown on a worker thread in a rayon
+pool of its own, and the canvas outlines the result. Measured on the 4-vCPU cloud VM (no GPU,
+llvmpipe) with `cargo run --release -p photocraft-ui-egui --example quick_selection_bench`: the
+real app in an offscreen harness, a 6000 × 4000 photo-like RGB document, pointer moves at 60 Hz
+in real time for 2 s along a wave inside an object, view at 50 %. "UI frame" is the app's logic
+for one frame (event handling, outline trace, canvas), without the GPU paint. Before is what the
+release used to cost: the whole stroke as one `select.quick` on the UI thread, with no outline
+while dragging (the same document and stroke).
+
+| Brush | Outline updates while dragging | Longest UI frame | Committed after release | Before: release stall |
+| --- | --- | --- | --- | --- |
+| 30 px | 14.8 / s (median 67 ms apart) | 5.7 ms | 119 ms | 471 ms (0 updates) |
+| 30 px, 4 s drag | 16.3 / s | 6.0 ms | 119 ms | 1445 ms (0 updates) |
+| 30 px, view at 25 %, 16 px a frame | 14.8 / s | 5.3 ms | 85 ms | 1385 ms (0 updates) |
+| 100 px | 5.4 / s (median 168 ms apart) | 12.8 ms | 170 ms | 543 ms (0 updates) |
