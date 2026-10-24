@@ -4,7 +4,7 @@ The loop (`prompts/LOOP.md`) reads and updates this table. Times are UTC.
 
 | # | Task | Upstream issues | State | Branch | Updated | Notes |
 |---|---|---|---|---|---|---|
-| 00 | [Quick Selection grows live while dragging](tasks/00-quick-selection-live.md) | #9145, #7266 | in-progress | claude/fix-00-quick-selection-live | 2026-10-24T17:25Z | The owner's main pain. Claimed; base upstream/main b07b7fab |
+| 00 | [Quick Selection grows live while dragging](tasks/00-quick-selection-live.md) | #9145, #7266 | in-progress | claude/fix-00-quick-selection-live | 2026-10-24T17:26Z | The owner's main pain. Base upstream/main b07b7fab. §2: api.github.com is 403 from the VM, so I checked only upstream's git log (no fix there); PR #7302 fetched via git as pull/7302/head (open, changes requested), but its reviews can't be read, so I went ahead and will credit it. Implementer running |
 | 01 | [Magic Wand matches Photoshop](tasks/01-magic-wand-parity.md) | #4902, #9145, #5775 | todo | | 2026-10-24T19:00Z | The owner's corner-clicking workflow |
 | 02 | [Background removal works end to end](tasks/02-background-removal-workflow.md) | (audit) | todo | | 2026-10-24T19:00Z | Audit; adds new tasks for big gaps |
 | 03 | [Remove Background cuts out product shots](tasks/03-remove-background-products.md) | #9145, #2788 | todo | | 2026-10-24T19:00Z | Model-free path |
