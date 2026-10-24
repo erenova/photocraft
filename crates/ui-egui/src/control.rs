@@ -127,6 +127,9 @@ pub enum Outcome {
     /// A command started a background job and the caller waits for it: reply with its result
     /// once it has been applied (or with its error / "cancelled").
     AfterJob(photocraft_engine::jobs::JobId),
+    /// Pointer input released a Quick Selection stroke that still grows: reply (`{status}`) once
+    /// it has been committed, so a following request observes its selection.
+    AfterQuickSelection,
 }
 
 /// The fields `ui.set` reads. Anything else is rejected before a field is applied, and every
@@ -1181,9 +1184,11 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
                 tool_event(app, ev, mods);
             }
             app.stylus.feed.set(None);
-            // A Quick Selection stroke released here is committed before the reply, so the caller
-            // sees its selection (on the canvas it commits once its segments have grown).
-            crate::quick_select_ui::flush(app);
+            // A Quick Selection stroke released here replies once committed, so the caller sees
+            // its selection (it commits once its segments have grown, off the UI thread).
+            if crate::quick_select_ui::finishing(app) {
+                return Outcome::AfterQuickSelection;
+            }
             ok(json!({"status": app.ui.status}))
         }
         "ui.click" | "ui.move" => {

@@ -3826,7 +3826,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         // A Quick Selection stroke under way outlines its selection so far (`quick_select_ui`).
         let quick = crate::quick_select_ui::shown(app, doc.id);
         let (outlined, k) = match &refined {
-            None if quick.is_some() => (quick.as_ref().and_then(|q| q.0.as_ref()), 1),
+            None if quick.is_some() => (quick.as_ref().and_then(|q| q.0.as_deref()), 1),
             None => (floated.as_ref().or(doc.selection.as_ref()), 1),
             Some(None) => (None, 1),
             Some(Some((proxy, k))) => (proxy.selection.as_ref(), (*k).max(1)),
@@ -3871,14 +3871,12 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             let bounds_key = if k > 1 { u64::MAX / 2 - doc.id.0 } else { u64::MAX - doc.id.0 };
             let carried_bounds = carried.then(|| app.cached_bounds(bounds_key, sel).intersect(&vis));
             let step = carried_bounds.map_or(step, |b| crate::outline::bounded_step(b, step));
-            let key = crate::surface_fingerprint(sel)
-                ^ u64::from(step).rotate_left(56)
-                ^ doc.id.0.rotate_left(17)
-                ^ (vis.x0 as u64) << 8
-                ^ (vis.y0 as u64) << 24
-                ^ (vis.x1 as u64) << 36
-                ^ (vis.y1 as u64) << 48
-                ^ u64::from(k).rotate_left(5);
+            let key = outline_key(sel, step, doc.id, vis, k);
+            // A Quick Selection stroke's worker traces its outlines here too (recorded before any
+            // stroke, so even its first segment's outline comes traced).
+            if k == 1 && !carried {
+                app.quick.outline_view = Some(crate::quick_select_ui::OutlineView { doc: doc.id, step, vis });
+            }
             let fresh = matches!(&app.outline_cache, Some((d, k, _)) if *d == doc.id && *k == key);
             if !fresh {
                 let t0 = crate::gpu_canvas::now_ms();
@@ -5118,6 +5116,21 @@ fn paint_mapped_quad(painter: &egui::Painter, xf: &ViewXform, origin: [f32; 2], 
     let ([x, y], [w, h]) = (origin, size);
     let pts = vec![xf.to_screen(x, y), xf.to_screen(x + w, y), xf.to_screen(x + w, y + h), xf.to_screen(x, y + h)];
     painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
+/// The outline cache key of selection `sel` traced at `step` over `vis` on document `doc` (a
+/// proxy reduced `k` times): the mask's tile identity, not the document revision, so unrelated
+/// edits don't re-trace it. Shared with the Quick Selection worker, which traces live outlines
+/// ahead of the canvas (`quick_select_ui`).
+pub(crate) fn outline_key(sel: &photocraft_raster::Surface, step: u32, doc: photocraft_doc::DocId, vis: photocraft_geom::Rect, k: u32) -> u64 {
+    crate::surface_fingerprint(sel)
+        ^ u64::from(step).rotate_left(56)
+        ^ doc.0.rotate_left(17)
+        ^ (vis.x0 as u64) << 8
+        ^ (vis.y0 as u64) << 24
+        ^ (vis.x1 as u64) << 36
+        ^ (vis.y1 as u64) << 48
+        ^ u64::from(k).rotate_left(5)
 }
 
 /// Draw boundary segments as marching ants: white base, black dashes phased along x + y.

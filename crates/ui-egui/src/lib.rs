@@ -744,8 +744,8 @@ pub struct PhotocraftApp {
     pub(crate) move_distance: Option<move_distance::Cache>,
     /// Object Selection › Object Finder: the hover preview (`object_finder`).
     pub(crate) object_finder: Option<object_finder::Finder>,
-    /// The Quick Selection stroke under way: its selection grows while dragging (`quick_select_ui`).
-    pub(crate) quick_live: Option<quick_select_ui::QuickLive>,
+    /// Quick Selection strokes under way: their selection grows while dragging (`quick_select_ui`).
+    pub(crate) quick: quick_select_ui::QuickState,
     /// A blend mode hovered in the Layers panel, shown live (`blend_preview`).
     pub(crate) blend_preview: Option<blend_preview::BlendPreview>,
     /// Layers panel drag: temporary reordered document displayed until mouse release.
@@ -1051,7 +1051,7 @@ impl PhotocraftApp {
             move_hover: None,
             move_distance: None,
             object_finder: None,
-            quick_live: None,
+            quick: Default::default(),
             blend_preview: None,
             reorder_preview: None,
             reorder_preview_hit: false,
@@ -1300,8 +1300,11 @@ impl PhotocraftApp {
     }
 
     fn run_command(&mut self, id: &str, params: Value) -> Result<Value, String> {
-        // A released Quick Selection stroke still growing is committed first: it came first.
-        quick_select_ui::flush(self);
+        // A released Quick Selection stroke still growing comes first: a command that edits the
+        // document waits for its commit.
+        if let Some(r) = quick_select_ui::defer(self, id, &params) {
+            return r;
+        }
         if !vector_ui::cancel_stale(self) {
             return Err(self.ui.status.clone());
         }
@@ -2199,6 +2202,7 @@ impl PhotocraftApp {
                     let _ = reply.send(v);
                 }
                 control::Outcome::AfterInput => self.input_waiters.push(reply),
+                control::Outcome::AfterQuickSelection => quick_select_ui::reply_when_committed(self, reply),
                 control::Outcome::AfterJob(job) => self.jobs.waiters.push((job, reply)),
                 control::Outcome::Screenshot { token, path } => {
                     // Wait out egui's fade animations (~83 ms) and a few rendered frames first.
@@ -2560,7 +2564,7 @@ impl eframe::App for PhotocraftApp {
         // the queue is empty, then release control replies waiting on it.
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
-        } else if !self.input_waiters.is_empty() {
+        } else if !self.input_waiters.is_empty() && !quick_select_ui::finishing(self) {
             for w in self.input_waiters.drain(..) {
                 let _ = w.send(serde_json::json!({"ok": true, "result": null}));
             }

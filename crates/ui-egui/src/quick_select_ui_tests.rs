@@ -5,6 +5,8 @@ use egui::Modifiers;
 use photocraft_geom::Rect;
 use serde_json::{Value, json};
 
+use std::sync::Arc;
+
 use super::*;
 use crate::canvas::{ToolEvent, tool_event};
 
@@ -55,7 +57,7 @@ fn doc_selection(app: &PhotocraftApp) -> Option<Surface> {
 
 fn preview(app: &PhotocraftApp) -> Option<Surface> {
     let doc = app.session.active().unwrap().doc.id;
-    shown(app, doc).expect("a stroke is under way").0
+    shown(app, doc).expect("a stroke has grown").0.map(|s| (*s).clone())
 }
 
 fn down(app: &mut PhotocraftApp, x: f64, y: f64, m: Modifiers) {
@@ -121,7 +123,9 @@ fn the_selection_grows_while_dragging_and_release_commits_what_was_shown() {
         if threaded {
             settle(&mut app);
         }
-        assert!(app.quick_live.is_none(), "threaded {threaded}: the stroke is committed once caught up");
+        assert!(idle(&app), "threaded {threaded}: the stroke is committed once caught up");
+        assert_eq!(app.quick.last_commit.as_ref().and_then(|r| r.as_ref().ok()).and_then(|v| v.get("fromLive")), Some(&json!(true)));
+        assert_eq!(app.quick.inline_grows, 0, "threaded {threaded}: nothing grew on the UI thread");
         let p = last_quick(&app);
         assert!(p["segments"].as_array().is_some_and(|s| s.len() > 1), "threaded {threaded}: {p}");
         let committed = bytes(doc_selection(&app).as_ref());
@@ -208,19 +212,141 @@ fn alt_subtracts_pressed_before_or_during_the_drag_and_shift_adds() {
 }
 
 #[test]
-fn a_command_during_the_catch_up_commits_the_stroke_first() {
+fn nothing_waits_for_a_stroke_still_growing_after_its_release() {
+    // Review of #9145: a new press and every command waited for the released stroke, growing its
+    // last segments on the UI thread (96 ms for a 30 px brush on 24 MP, 335 ms for 100 px). Now
+    // the workers are held until the end: if anything waited for them, this test would hang.
     let mut app = quick_app();
     app.background_jobs = true;
-    down(&mut app, 40.0, 300.0, Modifiers::NONE);
+    let gate = Arc::new(std::sync::RwLock::new(()));
+    app.quick.gate = Some(gate.clone());
+    let held = gate.write().unwrap();
+    down(&mut app, 100.0, 300.0, Modifiers::NONE);
     for k in 1..=4 {
-        drag(&mut app, 40.0 + 30.0 * f64::from(k), 300.0, Modifiers::NONE);
+        drag(&mut app, 100.0 + 40.0 * f64::from(k), 300.0, Modifiers::NONE);
     }
-    up(&mut app, 180.0, 300.0, Modifiers::NONE);
-    // Whatever is still growing, the next command comes after the stroke.
-    app.run("select.inverse", json!({})).unwrap();
-    let ids: Vec<&str> = app.session.journal.iter().rev().take(2).map(|(id, _)| id.as_str()).collect();
-    assert_eq!(ids, ["select.inverse", "select.quick"]);
-    assert!(app.quick_live.is_none());
+    up(&mut app, 260.0, 300.0, Modifiers::NONE);
+    assert!(finishing(&app));
+    // A view or tool command runs at once.
+    let r = app.run("tools.setBrush", json!({"brush": {"size": 24}})).unwrap();
+    assert_eq!(r.get("pending"), None, "{r}");
+    // A command that edits the document waits for the stroke, in order.
+    let r = app.run("select.inverse", json!({})).unwrap();
+    assert_eq!(r["pending"], true);
+    assert!(app.session.journal.iter().all(|(id, _)| id != "select.quick" && id != "select.inverse"));
+    // The next press queues behind the stroke, and is drawn meanwhile.
+    down(&mut app, 100.0, 450.0, Modifiers::NONE);
+    drag(&mut app, 160.0, 450.0, Modifiers::NONE);
+    up(&mut app, 200.0, 450.0, Modifiers::NONE);
+    drop(held);
+    settle(&mut app);
+    assert!(idle(&app));
+    let ids: Vec<&str> = app.session.journal.iter().map(|(id, _)| id.as_str()).filter(|id| id.starts_with("select.")).collect();
+    assert_eq!(ids, ["select.quick", "select.inverse", "select.quick"], "in the order they came");
+    let sel = doc_selection(&app);
+    // The first stroke, inverted, then the second added on top (New switched to Add on release).
+    assert!(sel.as_ref().is_some_and(|s| s.sample_channel(180, 300, 0) < 0.5 && s.sample_channel(10, 10, 0) >= 0.5 && s.sample_channel(180, 450, 0) >= 0.5));
+    assert_eq!(app.quick.inline_grows, 0, "nothing grew on the UI thread");
+}
+
+#[test]
+fn a_control_pointer_stroke_replies_once_committed() {
+    let mut app = quick_app();
+    app.background_jobs = true;
+    let gate = Arc::new(std::sync::RwLock::new(()));
+    app.quick.gate = Some(gate.clone());
+    let held = gate.write().unwrap();
+    let ctx = egui::Context::default();
+    let events = json!({"events": [{"kind": "down", "x": 100, "y": 300}, {"kind": "move", "x": 160, "y": 300}, {"kind": "up", "x": 200, "y": 300}]});
+    let (req, rx) = crate::control::ControlRequest::new("ui.pointer", events);
+    assert!(matches!(crate::control::handle(&mut app, &ctx, &req), crate::control::Outcome::AfterQuickSelection));
+    reply_when_committed(&mut app, req.reply.clone());
+    assert!(rx.try_recv().is_err(), "no reply while the stroke grows");
+    drop(held);
+    settle(&mut app);
+    let reply = rx.try_recv().expect("the reply once committed");
+    assert_eq!(reply["ok"], true);
+    assert_eq!(last_quick(&app)["mode"], "replace");
+}
+
+#[test]
+fn a_document_edited_under_a_drag_rebases_the_stroke() {
+    // Review of #9145: ⌘D during a drag made the release regrow every segment on the UI thread
+    // (2 s on 3000 × 2000) and commit something other than what was shown. The stroke now grows
+    // again on the edited document as the drag goes on, and the release commits what it showed.
+    for threaded in [false, true] {
+        let mut app = quick_app();
+        app.background_jobs = threaded;
+        app.ui.quick_selection_mode = ADD;
+        app.run("select.rect", json!({"x": 1300, "y": 20, "width": 40, "height": 40})).unwrap();
+        down(&mut app, 100.0, 300.0, Modifiers::NONE);
+        for k in 1..=4 {
+            drag(&mut app, 100.0 + 40.0 * f64::from(k), 300.0, Modifiers::NONE);
+            if threaded {
+                settle(&mut app);
+            }
+        }
+        assert!(preview(&app).is_some_and(|s| s.sample_channel(1320, 40, 0) >= 0.5), "the preview grows on top of the rectangle");
+        // ⌘D while the button is still down: no stroke is waiting, so it runs at once.
+        app.run("select.deselect", json!({})).unwrap();
+        for k in 5..=8 {
+            drag(&mut app, 100.0 + 40.0 * f64::from(k), 300.0, Modifiers::NONE);
+            if threaded {
+                settle(&mut app);
+            }
+        }
+        let shown = preview(&app);
+        assert!(shown.as_ref().is_some_and(|s| s.sample_channel(1320, 40, 0) < 0.5 && s.sample_channel(140, 300, 0) >= 0.5), "threaded {threaded}: rebased");
+        let last = bytes(shown.as_ref());
+        up(&mut app, 420.0, 300.0, Modifiers::NONE);
+        if threaded {
+            settle(&mut app);
+        }
+        assert!(idle(&app));
+        assert_eq!(
+            app.quick.last_commit.as_ref().and_then(|r| r.as_ref().ok()).and_then(|v| v.get("fromLive")),
+            Some(&json!(true)),
+            "threaded {threaded}: nothing regrown at the release"
+        );
+        assert_eq!(bytes(doc_selection(&app).as_ref()), last, "threaded {threaded}: released == last preview");
+        assert_eq!(app.quick.inline_grows, 0);
+    }
+}
+
+#[test]
+fn a_failing_worker_ends_the_stroke_with_an_error() {
+    let mut app = quick_app();
+    app.background_jobs = true;
+    app.quick.fail_workers = true;
+    let journal = app.session.journal.len();
+    down(&mut app, 100.0, 300.0, Modifiers::NONE);
+    settle(&mut app);
+    drag(&mut app, 160.0, 300.0, Modifiers::NONE);
+    up(&mut app, 200.0, 300.0, Modifiers::NONE);
+    settle(&mut app);
+    assert!(app.ui.status_error, "{}", app.ui.status);
+    assert!(idle(&app));
+    assert_eq!(app.session.journal.len(), journal, "no stroke regrown on the UI thread and committed");
+    assert_eq!(doc_selection(&app), None);
+}
+
+#[test]
+fn the_web_throttle_grows_at_most_a_third_of_the_time() {
+    // The web grows segments on the UI thread, timed by a frame clock that stands still within a
+    // frame (review of #9145: a clock stuck at 0 meant nothing grew until the release).
+    let mut t = Throttle::default();
+    assert!(t.ready(0.0), "the press grows at once");
+    t.grew(0.0);
+    assert!(!t.ready(0.0), "not again in the same frame");
+    // The next frame starts 5 ms later: the grow cost at most that; the next waits 100 ms.
+    assert!(!t.ready(5.0));
+    assert!(!t.ready(104.0));
+    assert!(t.ready(105.0));
+    // A slow grow (300 ms on a large document) is followed by twice its length.
+    t.grew(1000.0);
+    assert!(!t.ready(1300.0));
+    assert!(!t.ready(1899.0));
+    assert!(t.ready(1900.0));
 }
 
 #[test]
@@ -235,21 +361,19 @@ fn hostile_pointer_input_never_panics() {
                 drag(&mut app, x, y, Modifiers::ALT);
             }
             up(&mut app, f64::NEG_INFINITY, 0.0, Modifiers::NONE);
-            if threaded {
-                settle(&mut app);
-            }
-            flush(&mut app);
+            settle(&mut app);
+            pump(&mut app);
         }
     }
-    // 100 000 points in one drag: one segment, grown once.
+    // 100 000 points in one drag, the pointer barely moving: one segment, grown once.
     let mut app = quick_app();
     down(&mut app, 10.0, 10.0, Modifiers::NONE);
     if let Some(d) = app.drag.as_mut() {
-        d.points.extend((0..100_000).map(|i| [f64::from(i % 400), f64::from((i / 400) % 240), 1.0]));
+        d.points.extend((0..100_000).map(|i| [10.0 + f64::from(i % 2) * 1e-3, 10.0, 1.0]));
     }
     pump(&mut app);
     up(&mut app, 30.0, 30.0, Modifiers::NONE);
-    assert!(app.quick_live.is_none());
+    assert!(idle(&app));
     assert_eq!(last_quick(&app)["points"].as_array().map(Vec::len), Some(100_002));
     // No document: the press starts nothing and the release selects nothing.
     let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
@@ -257,7 +381,7 @@ fn hostile_pointer_input_never_panics() {
     down(&mut app, 10.0, 10.0, Modifiers::NONE);
     drag(&mut app, 20.0, 10.0, Modifiers::NONE);
     up(&mut app, 30.0, 10.0, Modifiers::NONE);
-    assert!(app.quick_live.is_none());
+    assert!(idle(&app));
 }
 
 #[test]
