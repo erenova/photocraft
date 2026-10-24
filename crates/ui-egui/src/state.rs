@@ -1565,6 +1565,10 @@ pub struct UiState {
     /// Marquee options-bar mode: 0 new, 1 add, 2 subtract, 3 intersect (modifier keys override).
     #[serde(default)]
     pub selection_mode: u8,
+    /// Quick Selection's own options-bar mode: 0 New, 1 Add, 2 Subtract (it has no Intersect;
+    /// New switches to Add after a stroke, `quick_select_ui`).
+    #[serde(default)]
+    pub quick_selection_mode: u8,
     #[serde(default)]
     pub tool_options: ToolOptions,
     /// In-progress polygonal lasso vertices (document coordinates).
@@ -1696,6 +1700,7 @@ impl Default for UiState {
             brush_tab: 0,
             brushes_panel: Default::default(),
             selection_mode: 0,
+            quick_selection_mode: 0,
             tool_options: ToolOptions::default(),
             polygon: Vec::new(),
             polygon_mode: String::new(),

@@ -70,7 +70,9 @@ pub fn confirm(app: &mut PhotocraftApp) -> Result<Value, String> {
 /// Reset Tool: `tool`'s options, its selection mode and its brush.
 fn reset_tool(app: &mut PhotocraftApp, tool: Tool) {
     reset_options(&mut app.ui.tool_options, tool);
-    if is_selection_tool(tool) {
+    if tool == Tool::QuickSelection {
+        app.ui.quick_selection_mode = crate::quick_select_ui::NEW;
+    } else if is_selection_tool(tool) {
         app.ui.selection_mode = 0;
     }
     if crate::paint_mouse::has_brush_picker(tool) {
@@ -85,6 +87,7 @@ fn reset_tool(app: &mut PhotocraftApp, tool: Tool) {
 fn reset_all(app: &mut PhotocraftApp) {
     app.ui.tool_options = ToolOptions::default();
     app.ui.selection_mode = 0;
+    app.ui.quick_selection_mode = crate::quick_select_ui::NEW;
     app.ui.tool_brushes.clear();
     reset_session_brush(app);
 }

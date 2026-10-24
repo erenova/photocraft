@@ -1017,6 +1017,11 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         // The options bar shows the active tool's brush: switch it in before drawing the
                         // chip, so a tool change swaps the brush with it (Photoshop keeps one per tool).
                         crate::paint_mouse::sync_tool_brush(app);
+                        // Photoshop's Quick Selection bar starts with its New / Add / Subtract buttons.
+                        if tool == Tool::QuickSelection {
+                            quick_selection_mode_buttons(app, ui);
+                            widgets::vline(ui, 22.0);
+                        }
                         // Brush edits here go through `tools.setBrush`, one journal entry per gesture (Rule 1).
                         if (tool.is_brushlike() && !matches!(tool, Tool::Brush | Tool::Pencil | Tool::MixerBrush | Tool::Eraser))
                             || tool == Tool::QuickSelection
@@ -4776,7 +4781,7 @@ fn effect_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer, depth: usi
 
 /// The options bar's Select and Mask… button: greyed out, as the menu item is, until there is a
 /// selection (or a layer mask) to refine (#7520).
-fn select_and_mask_button(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+pub(crate) fn select_and_mask_button(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let enabled = crate::menus::is_enabled(app, "select.selectAndMask");
     let clicked = ui.add_enabled_ui(enabled, |ui| widgets::secondary_button(ui, tl!("Select and Mask…"), 0.0).clicked()).inner;
     if clicked {
@@ -4786,6 +4791,17 @@ fn select_and_mask_button(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 
 /// New / add / subtract / intersect selection buttons (shared by selection tools).
 fn selection_mode_buttons(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    mode_buttons(ui, &mut app.ui.selection_mode, 4);
+}
+
+/// Quick Selection's New / Add / Subtract buttons: it has no Intersect, and its mode is its own
+/// (New switches to Add after a stroke, `quick_select_ui`).
+pub(crate) fn quick_selection_mode_buttons(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    mode_buttons(ui, &mut app.ui.quick_selection_mode, 3);
+}
+
+/// The first `count` of the New / Add / Subtract / Intersect buttons, choosing `mode`.
+fn mode_buttons(ui: &mut egui::Ui, mode: &mut u8, count: usize) {
     ui.spacing_mut().item_spacing.x = 2.0;
     for (i, (icon, tip)) in [
         ("square", tl!("New selection").to_string()),
@@ -4794,10 +4810,11 @@ fn selection_mode_buttons(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         ("squares-subtract", crate::i18n::fmt(tl!("Intersect with selection  ({key})"), &[("key", &crate::shortcuts::pretty("Shift+Alt"))])),
     ]
     .iter()
+    .take(count)
     .enumerate()
     {
-        if icons::button(ui, icon, 24.0, app.ui.selection_mode == i as u8, tip).clicked() {
-            app.ui.selection_mode = i as u8;
+        if icons::button(ui, icon, 24.0, *mode == i as u8, tip).clicked() {
+            *mode = i as u8;
         }
     }
     ui.spacing_mut().item_spacing.x = 8.0;

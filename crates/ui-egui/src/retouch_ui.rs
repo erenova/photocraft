@@ -147,12 +147,13 @@ pub fn finish_stroke(app: &mut PhotocraftApp, tool: Tool, points: &[[f64; 3]], m
             None => return false,
         },
         Tool::QuickSelection => {
-            let size = app.session.tools.brush.size;
-            let mode = if mods.alt { "subtract" } else { "add" };
-            let xy: Vec<[f64; 2]> = points.iter().map(|q| [q[0], q[1]]).collect();
-            let (sample_all, enhance) = (o.sample_all.quick_selection, o.enhance_edge);
-            let r = app.run("select.quick", json!({"points": xy, "size": size, "mode": mode, "enhanceEdge": enhance, "sampleAllLayers": sample_all}));
-            report_smart_result(app, r, tl!("Quick Selection found nothing there"));
+            // A stroke without a live selection (`quick_select_ui`) is selected whole on release.
+            let mut p = crate::quick_select_ui::settings(app);
+            let mode = crate::quick_select_ui::segment_mode(app.ui.quick_selection_mode, mods);
+            p["mode"] = json!(photocraft_engine::quick_stroke::mode_name(mode));
+            p["points"] = json!(points.iter().map(|q| [q[0], q[1]]).collect::<Vec<_>>());
+            let r = app.run("select.quick", p);
+            crate::quick_select_ui::committed(app, r);
             return true;
         }
         _ => return false,
@@ -641,15 +642,16 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
             crate::widgets::checkbox(ui, &mut o.cr_anti_alias, tl!("Anti-alias"));
         }
         Tool::HistoryBrush => opt(ui, tl!("Paints from the History panel's source state")),
+        // The New / Add / Subtract buttons come first, before the brush (`panels::options_bar`).
         Tool::QuickSelection => {
             crate::widgets::checkbox(ui, &mut o.sample_all.quick_selection, tl!("Sample All Layers"));
             crate::widgets::checkbox(ui, &mut o.enhance_edge, tl!("Enhance Edge"));
-            opt(ui, &crate::i18n::fmt(tl!("{key} to subtract"), &[("key", &crate::shortcuts::pretty("Alt"))]));
             crate::widgets::vline(ui, 22.0);
             if crate::widgets::secondary_button(ui, tl!("Select Subject"), 0.0).clicked() {
                 let r = app.run("select.subject", json!({}));
                 report_smart_result(app, r, tl!("No subject found — try Object Selection or the Lasso"));
             }
+            crate::panels::select_and_mask_button(app, ui);
         }
         Tool::ObjectSelection => {
             crate::widgets::checkbox(ui, &mut o.object_finder, tl!("Object Finder"));

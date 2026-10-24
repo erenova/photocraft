@@ -901,6 +901,8 @@ fn feed_live_stroke(app: &mut PhotocraftApp) {
     if app.defer_live_stroke {
         return;
     }
+    // Quick Selection grows its selection from the new points (`quick_select_ui`).
+    crate::quick_select_ui::pump(app);
     let (Some(l), Some(d)) = (app.live_stroke.as_mut(), app.drag.as_ref()) else { return };
     let pose = &app.stylus.stroke;
     // The same times `stroke_points` gives the commit (from the drag's first point).
@@ -3821,7 +3823,10 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         let refined = crate::select_mask_view::ants(app, idx);
         // A floating piece's ants hug the pixels being moved.
         let floated = floating_outline(app, idx);
+        // A Quick Selection stroke under way outlines its selection so far (`quick_select_ui`).
+        let quick = crate::quick_select_ui::shown(app, doc.id);
         let (outlined, k) = match &refined {
+            None if quick.is_some() => (quick.as_ref().and_then(|q| q.0.as_ref()), 1),
             None => (floated.as_ref().or(doc.selection.as_ref()), 1),
             Some(None) => (None, 1),
             Some(Some((proxy, k))) => (proxy.selection.as_ref(), (*k).max(1)),
@@ -3877,7 +3882,9 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             let fresh = matches!(&app.outline_cache, Some((d, k, _)) if *d == doc.id && *k == key);
             if !fresh {
                 let t0 = crate::gpu_canvas::now_ms();
-                let b = carried_bounds.unwrap_or_else(|| app.cached_bounds(bounds_key, sel).intersect(&vis));
+                // The live stroke's bounds come with each grown segment, off the UI thread.
+                let quick_bounds = quick.as_ref().filter(|_| refined.is_none()).map(|q| q.1);
+                let b = carried_bounds.unwrap_or_else(|| quick_bounds.unwrap_or_else(|| app.cached_bounds(bounds_key, sel)).intersect(&vis));
                 // Filters can occupy every worker in Rayon's global pool. A parallel scan here would
                 // block the UI thread waiting for those workers, preventing job cancellation (#1554).
                 let mut segs =
@@ -4318,7 +4325,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         // and a click (or a long press that never moved) just ends it.
         let physical_right = app.services.right_button_down.as_ref().is_some_and(|f| f());
         let right_down = ui.input(|i| i.pointer.secondary_down()) || physical_right;
-        if strokes_live(tool)
+        if (strokes_live(tool) || tool == Tool::QuickSelection)
             && !right_down
             && app.drag.is_none()
             && response.is_pointer_button_down_on()
@@ -5663,6 +5670,8 @@ fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter, xf: &View
                 draw_smoothing_string(painter, xf, s);
             }
         }
+        // Quick Selection's live outline shows the stroke once its first segment has grown.
+        Tool::QuickSelection if crate::quick_select_ui::has_grown(app) => {}
         t if t.is_brushlike() || t == Tool::QuickSelection => {
             // Retouching strokes preview as a translucent trail of the brush footprint: a mask,
             // not a brush-wide egui polyline (which zoomed in tessellates into wedges, #189).
@@ -6283,6 +6292,9 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
                 app.stylus.record_point();
             }
             app.live_stroke = if strokes_live(tool) { begin_live_stroke(app) } else { None };
+            if tool == Tool::QuickSelection {
+                crate::quick_select_ui::begin(app);
+            }
         }
         ToolEvent::Move { x, y, pressure } => {
             // Polygonal Lasso: ⌥ held while the button is down draws freehand into the polygon;
@@ -6617,6 +6629,10 @@ pub(crate) fn finish_gesture(app: &mut PhotocraftApp, d: Drag) {
         && let Some(st) = app.session.active()
     {
         app.last_stroke_end = Some((st.doc.id, end));
+    }
+    // Quick Selection: the live stroke takes its last points and commits once they have grown.
+    if d.tool == Tool::QuickSelection && crate::quick_select_ui::release(app, &d) {
+        return;
     }
     // A live retouching preview ends here; the commit below replaces it (the Clone Stamp's,
     // History Brush's and sequential-dab tools' with the pixels it already drew).

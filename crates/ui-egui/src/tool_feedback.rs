@@ -54,12 +54,15 @@ pub fn is_selection_tool(tool: Tool) -> bool {
 /// 2 Subtract, 3 Intersect) and the held modifiers: exactly what the tool's gesture will use.
 pub fn selection_mode(tool: Tool, bar: u8, m: egui::Modifiers) -> &'static str {
     match tool {
-        // Quick Selection always adds (⌥ subtracts), like Photoshop's after the first stroke.
+        // Quick Selection: its own bar (New, Add, Subtract; no Intersect, `quick_select_ui`),
+        // ⌥ subtracts and ⇧ adds while held.
         Tool::QuickSelection => {
             if m.alt {
                 "subtract"
-            } else {
+            } else if m.shift {
                 "add"
+            } else {
+                ["replace", "add", "subtract"][bar.min(2) as usize]
             }
         }
         // Object Selection: ⌥ subtracts, ⇧ adds (see `retouch_ui::finish_object_selection`).
@@ -90,9 +93,16 @@ pub fn selection_mode(tool: Tool, bar: u8, m: egui::Modifiers) -> &'static str {
 /// subtract from or intersect with, so it draws a new selection, as in Photoshop (where ⌥ then
 /// only draws a marquee from its centre). An options-bar Subtract or Intersect is kept (#1106).
 pub fn document_selection_mode(app: &PhotocraftApp, tool: Tool, m: egui::Modifiers) -> &'static str {
-    let mode = selection_mode(tool, app.ui.selection_mode, m);
+    let bar = bar_mode(app, tool);
+    let mode = selection_mode(tool, bar, m);
     let selected = app.session.active().and_then(|st| st.doc.selection.as_ref()).is_some_and(|s| !s.content_bounds().is_empty());
-    if m.alt && !selected && matches!(mode, "subtract" | "intersect") && selection_mode(tool, app.ui.selection_mode, egui::Modifiers::NONE) == "replace" {
+    // Quick Selection's ⌥ only ever subtracts (it never draws from the centre).
+    if tool != Tool::QuickSelection
+        && m.alt
+        && !selected
+        && matches!(mode, "subtract" | "intersect")
+        && selection_mode(tool, bar, egui::Modifiers::NONE) == "replace"
+    {
         "replace"
     } else {
         mode
@@ -129,7 +139,12 @@ pub fn badge(app: &PhotocraftApp, tool: Tool, m: egui::Modifiers) -> Option<Badg
     if matches!(tool, Tool::Lasso | Tool::PolygonLasso) && app.drag.is_none() && app.session.active().is_none_or(|st| st.doc.selection.is_none()) {
         m.alt = false;
     }
-    Badge::from_mode(selection_mode(tool, app.ui.selection_mode, m))
+    Badge::from_mode(selection_mode(tool, bar_mode(app, tool), m))
+}
+
+/// The options-bar mode `tool` uses: Quick Selection keeps its own (`UiState::quick_selection_mode`).
+pub fn bar_mode(app: &PhotocraftApp, tool: Tool) -> u8 {
+    if tool == Tool::QuickSelection { app.ui.quick_selection_mode } else { app.ui.selection_mode }
 }
 
 /// The badge's glyph as line segments around `c` (half-size `h`).
@@ -249,9 +264,19 @@ mod tests {
         assert_eq!(badge(&app, Tool::Lasso, shift), Some(Badge::Add));
         app.ui.selection_mode = 3;
         assert_eq!(badge(&app, Tool::RectMarquee, none), Some(Badge::Intersect));
-        // Smart selection tools.
+        // Smart selection tools. Quick Selection has its own bar (New, Add, Subtract): New shows
+        // no badge, ⌥ subtracts and ⇧ adds whatever it says, and there is no Intersect.
+        assert_eq!(badge(&app, Tool::QuickSelection, none), None);
+        assert_eq!(badge(&app, Tool::QuickSelection, alt), Some(Badge::Subtract));
+        assert_eq!(badge(&app, Tool::QuickSelection, shift), Some(Badge::Add));
+        assert_eq!(badge(&app, Tool::QuickSelection, both), Some(Badge::Subtract));
+        app.ui.quick_selection_mode = crate::quick_select_ui::ADD;
         assert_eq!(badge(&app, Tool::QuickSelection, none), Some(Badge::Add));
         assert_eq!(badge(&app, Tool::QuickSelection, alt), Some(Badge::Subtract));
+        app.ui.quick_selection_mode = crate::quick_select_ui::SUBTRACT;
+        assert_eq!(badge(&app, Tool::QuickSelection, none), Some(Badge::Subtract));
+        assert_eq!(badge(&app, Tool::QuickSelection, shift), Some(Badge::Add));
+        app.ui.quick_selection_mode = crate::quick_select_ui::NEW;
         assert_eq!(badge(&app, Tool::ObjectSelection, none), None);
         assert_eq!(badge(&app, Tool::ObjectSelection, shift), Some(Badge::Add));
         // Other tools never show one.

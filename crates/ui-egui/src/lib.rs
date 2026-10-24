@@ -187,6 +187,7 @@ pub mod props_layout;
 pub mod proxy;
 pub mod puppet_ui;
 pub mod quick_pick;
+pub mod quick_select_ui;
 pub mod rasterize_prompt;
 pub mod replace_prompt;
 pub mod retouch_ui;
@@ -743,6 +744,8 @@ pub struct PhotocraftApp {
     pub(crate) move_distance: Option<move_distance::Cache>,
     /// Object Selection › Object Finder: the hover preview (`object_finder`).
     pub(crate) object_finder: Option<object_finder::Finder>,
+    /// The Quick Selection stroke under way: its selection grows while dragging (`quick_select_ui`).
+    pub(crate) quick_live: Option<quick_select_ui::QuickLive>,
     /// A blend mode hovered in the Layers panel, shown live (`blend_preview`).
     pub(crate) blend_preview: Option<blend_preview::BlendPreview>,
     /// Layers panel drag: temporary reordered document displayed until mouse release.
@@ -1048,6 +1051,7 @@ impl PhotocraftApp {
             move_hover: None,
             move_distance: None,
             object_finder: None,
+            quick_live: None,
             blend_preview: None,
             reorder_preview: None,
             reorder_preview_hit: false,
@@ -1296,6 +1300,8 @@ impl PhotocraftApp {
     }
 
     fn run_command(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        // A released Quick Selection stroke still growing is committed first: it came first.
+        quick_select_ui::flush(self);
         if !vector_ui::cancel_stale(self) {
             return Err(self.ui.status.clone());
         }
@@ -2322,6 +2328,7 @@ impl eframe::App for PhotocraftApp {
         discard_ui::guard_window_close(self, ctx);
         // Background jobs: apply finished ones, keep frames coming, Esc cancels (before the
         // shortcuts see Esc).
+        quick_select_ui::tick(self, ctx);
         if !screen_picker::tick(self, ctx) {
             jobs_ui::tick(self, ctx);
             #[cfg(not(target_arch = "wasm32"))]
