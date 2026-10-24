@@ -88,35 +88,22 @@ fn apply(s: &mut Session, label: &str, region: Option<&Region>, m: SelectionMode
     Ok(json!({ "selected": selected, "changed": true, "bounds": bbox.map(|r| [r.x0, r.y0, r.width() as i32, r.height() as i32]) }))
 }
 
-fn points(p: &Value) -> Vec<(f32, f32)> {
-    p.get("points")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|q| Some((q.get(0)?.as_f64()? as f32, q.get(1)?.as_f64()? as f32))).collect())
-        .unwrap_or_default()
-}
-
 /// Auto-Enhance for Quick Selection: a light edge refinement that flows the edge towards image
 /// edges and removes blockiness.
 const ENHANCE: RefineParams = RefineParams { radius: 4.0, smart_radius: true, smooth: 15.0, feather: 0.0, contrast: 25.0, shift_edge: 0.0 };
 
-fn quick_selection(s: &mut Session, p: &Value) -> Result<Value> {
-    let pts = points(p);
-    if pts.is_empty() {
-        return Err(bad("select.quick", "needs at least one point"));
-    }
-    let size = f(p, "size", 30.0).clamp(1.0, 5000.0);
-    let m = match p.get("mode").and_then(Value::as_str).unwrap_or("add") {
-        "subtract" => SelectionMode::Subtract,
-        "replace" | "new" => SelectionMode::Replace,
-        _ => SelectionMode::Add,
-    };
-    let enhance = b(p, "enhanceEdge", false);
-    let region = with_sampler(s, b(p, "sampleAllLayers", false), |smp, doc| {
+/// The region one Quick Selection segment (the polyline `pts`, brush diameter `size`) grows to on
+/// `layer` of `doc` (or the composite), Auto-Enhanced with `enhance`; `None` when it misses.
+pub(crate) fn quick_region(doc: &Document, layer: Option<LayerId>, all_layers: bool, pts: &[(f32, f32)], size: f32, enhance: bool) -> Option<Region> {
+    with_doc_sampler(doc, layer, all_layers, |smp, doc| {
         let canvas = doc.bounds();
-        let r = quick::quick_select(smp, canvas, &pts, size)?;
+        let r = quick::quick_select(smp, canvas, pts, size)?;
         if enhance { matting::refine_mask(smp, &matting::region_reader(&r), r.bbox, canvas, &ENHANCE) } else { Some(r) }
-    })?;
-    apply(s, "Quick Selection", region.as_ref(), m)
+    })
+}
+
+fn quick_selection(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::quick_stroke::run(s, p)
 }
 
 fn rect_param(p: &Value) -> Option<Rect> {
@@ -527,7 +514,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "select.quick",
             "Quick Selection",
             [],
-            r##"{"points":[[x,y],…],"size":px=30,"mode":"add|subtract|replace"="add","sampleAllLayers":bool=false,"enhanceEdge":bool=false}"##,
+            r##"{"points":[[x,y],…],"size":px=30,"mode":"add|subtract|replace"="add","segments":[n | {"points":n,"mode":"add|subtract|replace"},…]=[all points],"sampleAllLayers":bool=false,"enhanceEdge":bool=false} (segments: how the stroke was cut while it was painted, point counts adding up to the number of points; each segment grows on its own from the previous one's last point and is combined into the selection in order, in its own mode or the stroke's; a stroke replaces once, its later segments add)"##,
             has_doc,
             quick_selection
         ),

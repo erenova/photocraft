@@ -101,6 +101,7 @@ pub mod preset_store;
 pub mod presets;
 pub mod print_cmds;
 pub mod proof_sim;
+pub mod quick_stroke;
 pub mod rasterize_style_cmds;
 pub mod redeye_cmds;
 pub mod render_cmds;
@@ -545,6 +546,9 @@ pub struct Session {
     /// A finished live stroke offered to the `paint.stroke` / `paint.pencil` that commits it
     /// ([`Session::offer_live_stroke`]).
     pub(crate) live_commit: Option<brush_cmds::LiveCommit>,
+    /// A live Quick Selection stroke offered to the `select.quick` that commits it
+    /// ([`Session::offer_live_quick`]).
+    pub(crate) live_quick: Option<quick_stroke::QuickCommit>,
     /// Documents a background open decoded but held back until the user answers the profile
     /// prompt ([`ColorState::open_question`](color_cmds::ColorState::open_question)): `(id,
     /// document, source read-only)`. The shell takes them with [`Session::take_held_open`].
@@ -729,6 +733,7 @@ impl Session {
     /// Withdraw an offer the command didn't take.
     pub fn clear_live_stroke(&mut self) {
         self.live_commit = None;
+        self.live_quick = None;
     }
 
     /// Check a call without running it: the command exists, its params have the shape
