@@ -4,7 +4,7 @@
 //!
 //! A stroke is selected segment by segment (`photocraft_engine::quick_stroke`), cut by the
 //! pointer's travel alone (`Cutter`), so the same motion gives the same selection on any machine,
-//! and each segment is seeded by the stroke painted so far. On the desktop a segment grows on a
+//! and each segment is led by the stroke's last segment of travel. On the desktop a segment grows on a
 //! worker thread, in a thread pool of its own, and the worker also traces the new outline for the
 //! view, so the UI thread never waits for either; on the web (no threads) a segment grows on the
 //! UI thread, throttled so it takes at most a third of the time ([`Throttle`]); with background

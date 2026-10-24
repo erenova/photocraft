@@ -309,9 +309,10 @@ fn in_square(s: &Session) -> (usize, usize) {
 
 #[test]
 fn a_short_drag_takes_the_square_however_it_is_cut() {
-    // Review of #9145: segments seeded only by their own points took a brush band (3,196 px)
+    // Review of #9145: segments grown from their own points alone took a brush band (3,196 px)
     // where the whole stroke takes the square (90,000): a fast machine cutting the drag finer
-    // selected less. Seeded by the stroke so far, every cut takes the square, as Photoshop does.
+    // selected less. Led by the stroke's last segment of travel, every cut takes the square, as
+    // Photoshop does with one stroke.
     let pts: Vec<[f64; 2]> = (0..9).map(|i| [220.0 + 7.5 * f64::from(i), 250.0]).collect();
     let mut cutter = Cutter::new(30.0);
     for p in &pts {

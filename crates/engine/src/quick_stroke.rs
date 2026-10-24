@@ -4,13 +4,13 @@
 //! outline follows the pointer and spreads to the edges near it (Adobe Help, "Paint a selection
 //! with Quick Selection tool"). Recomputing the whole stroke on every pointer move costs more
 //! the longer the stroke gets, so a stroke is selected **segment by segment**: each segment (its
-//! points, joined to the previous segment's last point) is grown by
-//! [`quick_select_in_stroke`](photocraft_algo::segment::quick::quick_select_in_stroke) in a
-//! working window around itself, seeded by the stroke painted so far wherever that falls in the
-//! window, and combined into the selection as it stands, in order. An update costs what its new
-//! segment covers, however long the stroke already is, and the stroke takes what it takes as one:
-//! a short drag inside an object too big for a click selects the object (measured in Photoshop,
-//! `quick_select_a_short_drag_takes_what_a_click_does_not`), however it was cut.
+//! points, joined to the previous segment's last point and led by the stroke's last
+//! [`segment_overlap`] of travel before it) is grown by
+//! [`quick_select`](photocraft_algo::segment::quick::quick_select) and combined into the selection
+//! as it stands, in order. An update costs what a segment and its lead cover, however long the
+//! stroke already is, and a stroke takes what it takes as one over that span: a short drag inside
+//! an object too big for a click selects the object (measured in Photoshop,
+//! `quick_select_a_short_drag_takes_what_a_click_does_not`), as it does in one segment.
 //!
 //! A live stroke is cut by the pointer's travel alone ([`Cutter`]), never by how long a segment
 //! takes to grow, so the same motion gives the same selection on any machine. `select.quick`
@@ -50,6 +50,13 @@ pub const MIN_TRAVEL: f32 = 24.0;
 pub fn segment_travel(size: f32) -> f32 {
     let size = if size.is_finite() { size } else { 30.0 };
     (1.25 * size).max(MIN_TRAVEL)
+}
+
+/// How much of the stroke before a segment (document px of travel) seeds it too: one segment's
+/// travel, so every segment is grown with at least the last two segments' worth of stroke, enough
+/// for a short drag inside an object to take it as one stroke does.
+pub fn segment_overlap(size: f32) -> f32 {
+    segment_travel(size)
 }
 
 /// Cuts a live stroke into segments as its points arrive, by the pointer's travel alone: the
@@ -251,10 +258,9 @@ impl QuickSource {
         self.base == o.base && self.layer == o.layer && self.all_layers == o.all_layers && self.size.to_bits() == o.size.to_bits() && self.enhance == o.enhance
     }
 
-    /// The region one segment (`pts`, a polyline) grows to, seeded by the stroke's earlier
-    /// polylines `context` too, or `None` when it misses the canvas.
-    pub fn region(&self, pts: &[(f32, f32)], context: &[&[(f32, f32)]]) -> Option<Region> {
-        crate::smartselect_cmds::quick_region(&self.doc, self.layer, self.all_layers, pts, context, self.size, self.enhance)
+    /// The region a segment (`pts`, a polyline) grows to, or `None` when it misses the canvas.
+    pub fn region(&self, pts: &[(f32, f32)]) -> Option<Region> {
+        crate::smartselect_cmds::quick_region(&self.doc, self.layer, self.all_layers, pts, self.size, self.enhance)
     }
 }
 
@@ -267,8 +273,9 @@ pub struct QuickStroke {
     last: Option<(f32, f32)>,
     /// A segment has found something: a later `replace` segment adds.
     applied: bool,
-    /// Every segment's polyline, and whether it subtracts: the seeds of later segments of its kind.
-    lines: Vec<(bool, Vec<(f32, f32)>)>,
+    /// The polyline of the stroke since its mode last changed between subtracting and selecting,
+    /// and whether it subtracts: the next segment of its kind is led by its end.
+    run: (bool, Vec<(f32, f32)>),
     /// A segment found something.
     changed: bool,
     /// Everything the segments found.
@@ -280,7 +287,16 @@ pub struct QuickStroke {
 impl QuickStroke {
     /// A stroke starting from the selection `base`.
     pub fn new(base: Option<Surface>) -> Self {
-        Self { selection: base, last: None, applied: false, lines: Vec::new(), changed: false, bounds: Rect::EMPTY, points: Vec::new(), segments: Vec::new() }
+        Self {
+            selection: base,
+            last: None,
+            applied: false,
+            run: (false, Vec::new()),
+            changed: false,
+            bounds: Rect::EMPTY,
+            points: Vec::new(),
+            segments: Vec::new(),
+        }
     }
 
     /// Select the next segment, `pts` (non-finite points are skipped), in `mode`. Returns the
@@ -288,20 +304,22 @@ impl QuickStroke {
     pub fn push(&mut self, src: &QuickSource, pts: &[(f32, f32)], mode: SelectionMode) -> Rect {
         let pts: Vec<(f32, f32)> = pts.iter().copied().filter(|(x, y)| x.is_finite() && y.is_finite()).collect();
         let Some(&end) = pts.last() else { return Rect::EMPTY };
-        let mut line = Vec::with_capacity(pts.len() + 1);
-        line.extend(self.last);
+        // The stroke's run of this kind, so far: a change between selecting and subtracting starts
+        // a new one at the previous segment's last point.
+        let subtracts = mode == SelectionMode::Subtract;
+        if self.run.0 != subtracts || self.run.1.is_empty() {
+            self.run = (subtracts, self.last.into_iter().collect());
+        }
+        // Led by the run's last `segment_overlap` of travel, then the segment itself.
+        let lead = self.run.1.get(lead_start(&self.run.1, segment_overlap(src.size()))..).unwrap_or_default();
+        let mut line = Vec::with_capacity(lead.len() + pts.len());
+        line.extend_from_slice(lead);
         line.extend_from_slice(&pts);
+        self.run.1.extend_from_slice(&pts);
         self.last = Some(end);
         self.points.extend_from_slice(&pts);
         self.segments.push((pts.len(), mode));
-        // Seeded by the stroke so far: its segments that select (or subtract) like this one.
-        let subtracts = mode == SelectionMode::Subtract;
-        let region = {
-            let context: Vec<&[(f32, f32)]> = self.lines.iter().filter(|(s, _)| *s == subtracts).map(|(_, l)| l.as_slice()).collect();
-            src.region(&line, &context)
-        };
-        self.lines.push((subtracts, line));
-        let Some(region) = region else { return Rect::EMPTY };
+        let Some(region) = src.region(&line) else { return Rect::EMPTY };
         // Only the stroke's first segment that finds anything replaces: a later one adds, so it
         // never wipes what the stroke did before it (a subtraction with ⌥ held, say).
         let m = if mode == SelectionMode::Replace && self.applied { SelectionMode::Add } else { mode };
@@ -341,6 +359,20 @@ impl QuickStroke {
         let points: Vec<[f64; 2]> = self.points.iter().map(|&(x, y)| [f64::from(x), f64::from(y)]).collect();
         json!({"points": points, "segments": segments, "mode": mode_name(mode)})
     }
+}
+
+/// Where the last `travel` (document px) of the polyline `run` starts: the index of its first point.
+fn lead_start(run: &[(f32, f32)], travel: f32) -> usize {
+    let mut back = 0.0f32;
+    let mut i = run.len().saturating_sub(1);
+    while i > 0 && back < travel {
+        if let (Some(a), Some(b)) = (run.get(i - 1), run.get(i)) {
+            let d = (b.0 - a.0).hypot(b.1 - a.1);
+            back += if d.is_finite() { d } else { travel };
+        }
+        i -= 1;
+    }
+    i
 }
 
 /// A stroke selected live, offered to the `select.quick` that commits it

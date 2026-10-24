@@ -87,28 +87,16 @@ pub fn quick_select_with(sampler: &dyn Sampler, canvas: Rect, points: &[(f32, f3
     quick_select_using::<true>(sampler, canvas, points, size, t)
 }
 
-/// One segment of a stroke painted so far: [`quick_select`] for the polyline `points`, with the
-/// stroke's earlier polylines `context` seeding it too, wherever they fall in its working window.
-/// The window follows `points` alone, so a segment costs what it covers, not what the stroke
-/// does; the seeds are the stroke's, so a stroke selected segment by segment takes what it takes
-/// as one (a short drag inside an object too big for a click selects the object, however the drag
-/// is cut). `None` when `points` miss the canvas.
-pub fn quick_select_in_stroke(sampler: &dyn Sampler, canvas: Rect, points: &[(f32, f32)], context: &[&[(f32, f32)]], size: f32) -> Option<Region> {
-    quick_select_batched::<true>(sampler, canvas, points, context, size, &Tuning::default(), SPECULATE).map(|(region, _)| region)
-}
-
 pub(super) fn quick_select_using<const OPTIMIZED: bool>(sampler: &dyn Sampler, canvas: Rect, points: &[(f32, f32)], size: f32, t: &Tuning) -> Option<Region> {
-    quick_select_batched::<OPTIMIZED>(sampler, canvas, points, &[], size, t, SPECULATE).map(|(region, _)| region)
+    quick_select_batched::<OPTIMIZED>(sampler, canvas, points, size, t, SPECULATE).map(|(region, _)| region)
 }
 
-/// [`quick_select_using`] cutting `batch` window sizes at a time (1: one after another), with
-/// `context` polylines seeding too (see [`quick_select_in_stroke`]). Also returns how many window
-/// sizes, smallest first, it took to find the kept one.
+/// [`quick_select_using`] cutting `batch` window sizes at a time (1: one after another). Also
+/// returns how many window sizes, smallest first, it took to find the kept one.
 pub(super) fn quick_select_batched<const OPTIMIZED: bool>(
     sampler: &dyn Sampler,
     canvas: Rect,
     points: &[(f32, f32)],
-    context: &[&[(f32, f32)]],
     size: f32,
     t: &Tuning,
     batch: usize,
@@ -147,13 +135,10 @@ pub(super) fn quick_select_batched<const OPTIMIZED: bool>(
         let img = sampler.rgb_scaled(window, step as usize);
         let (lw, lh) = (img.w, img.h);
         let s = step as f32;
-        let local = |p: &[(f32, f32)]| -> Vec<(f32, f32)> { p.iter().map(|&(x, y)| ((x - window.x0 as f32) / s, (y - window.y0 as f32) / s)).collect() };
-        let mut seeds = stroke_mask(&local(points), rw.max(0.5), lw, lh);
+        let pts: Vec<(f32, f32)> = points.iter().map(|&(x, y)| ((x - window.x0 as f32) / s, (y - window.y0 as f32) / s)).collect();
+        let seeds = stroke_mask(&pts, rw.max(0.5), lw, lh);
         if !seeds.iter().any(|v| *v) {
             return Attempt::NoSeeds;
-        }
-        for run in context {
-            stroke_mask_into(&mut seeds, &local(run), rw.max(0.5), lw, lh);
         }
         if cancel() {
             return Attempt::Cancelled;
@@ -331,15 +316,6 @@ fn cut_levels<const OPTIMIZED: bool>(
 /// Pixels within `radius` (working pixels) of the polyline `pts`, plus each point's own pixel.
 pub fn stroke_mask(pts: &[(f32, f32)], radius: f32, w: usize, h: usize) -> Vec<bool> {
     let mut m = vec![false; w * h];
-    stroke_mask_into(&mut m, pts, radius, w, h);
-    m
-}
-
-/// [`stroke_mask`] added to `m` (`w` x `h`): parts of the polyline outside it are skipped.
-fn stroke_mask_into(m: &mut [bool], pts: &[(f32, f32)], radius: f32, w: usize, h: usize) {
-    if pts.is_empty() || m.len() < w.saturating_mul(h) {
-        return;
-    }
     let segs: Vec<((f32, f32), (f32, f32))> = if pts.len() == 1 { vec![(pts[0], pts[0])] } else { pts.windows(2).map(|p| (p[0], p[1])).collect() };
     for (a, b) in segs {
         let x0 = ((a.0.min(b.0) - radius).floor().max(0.0)) as usize;
@@ -364,6 +340,7 @@ fn stroke_mask_into(m: &mut [bool], pts: &[(f32, f32)], radius: f32, w: usize, h
             m[y as usize * w + x as usize] = true;
         }
     }
+    m
 }
 
 /// Bilinear upsampling (pixel centres aligned, edges clamped) of a working-resolution selection

@@ -92,21 +92,12 @@ fn apply(s: &mut Session, label: &str, region: Option<&Region>, m: SelectionMode
 /// edges and removes blockiness.
 const ENHANCE: RefineParams = RefineParams { radius: 4.0, smart_radius: true, smooth: 15.0, feather: 0.0, contrast: 25.0, shift_edge: 0.0 };
 
-/// The region one Quick Selection segment (the polyline `pts`, brush diameter `size`, seeded by
-/// the stroke's earlier polylines `context` too) grows to on `layer` of `doc` (or the composite),
-/// Auto-Enhanced with `enhance`; `None` when it misses.
-pub(crate) fn quick_region(
-    doc: &Document,
-    layer: Option<LayerId>,
-    all_layers: bool,
-    pts: &[(f32, f32)],
-    context: &[&[(f32, f32)]],
-    size: f32,
-    enhance: bool,
-) -> Option<Region> {
+/// The region one Quick Selection segment (the polyline `pts`, brush diameter `size`) grows to on
+/// `layer` of `doc` (or the composite), Auto-Enhanced with `enhance`; `None` when it misses.
+pub(crate) fn quick_region(doc: &Document, layer: Option<LayerId>, all_layers: bool, pts: &[(f32, f32)], size: f32, enhance: bool) -> Option<Region> {
     with_doc_sampler(doc, layer, all_layers, |smp, doc| {
         let canvas = doc.bounds();
-        let r = quick::quick_select_in_stroke(smp, canvas, pts, context, size)?;
+        let r = quick::quick_select(smp, canvas, pts, size)?;
         if enhance { matting::refine_mask(smp, &matting::region_reader(&r), r.bbox, canvas, &ENHANCE) } else { Some(r) }
     })
 }
