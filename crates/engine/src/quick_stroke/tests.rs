@@ -276,3 +276,148 @@ fn hostile_strokes_are_refused_or_survived_never_a_panic() {
         assert!(src.size() >= 1.0 && src.size().is_finite());
     }
 }
+
+/// A 500 × 500 document with a 300 px red square on blue (the algorithm's Photoshop-measured
+/// short-drag case, `quick_select_a_short_drag_takes_what_a_click_does_not`).
+fn square_doc() -> Session {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 500, "height": 500})).unwrap();
+    s.edit("paint", |doc, a| {
+        let surf = doc.layer_mut(a.unwrap()).unwrap().surface_mut().unwrap();
+        surf.fill_rect(Rect::new(0, 0, 500, 500), &[60.0 / 255.0, 60.0 / 255.0, 200.0 / 255.0, 1.0]);
+        surf.fill_rect(Rect::new(100, 100, 400, 400), &[200.0 / 255.0, 60.0 / 255.0, 60.0 / 255.0, 1.0]);
+        Ok(())
+    })
+    .unwrap();
+    s
+}
+
+/// Selected pixels inside the square, and outside it.
+fn in_square(s: &Session) -> (usize, usize) {
+    let st = s.active().unwrap();
+    let Some(sel) = st.doc.selection.as_ref() else { return (0, 0) };
+    let (mut i, mut o) = (0, 0);
+    for y in 0..500 {
+        for x in 0..500 {
+            if sel.sample_channel(x, y, 0) >= 0.5 {
+                if (100..400).contains(&x) && (100..400).contains(&y) { i += 1 } else { o += 1 }
+            }
+        }
+    }
+    (i, o)
+}
+
+#[test]
+fn a_short_drag_takes_the_square_however_it_is_cut() {
+    // Review of #9145: segments seeded only by their own points took a brush band (3,196 px)
+    // where the whole stroke takes the square (90,000): a fast machine cutting the drag finer
+    // selected less. Seeded by the stroke so far, every cut takes the square, as Photoshop does.
+    let pts: Vec<[f64; 2]> = (0..9).map(|i| [220.0 + 7.5 * f64::from(i), 250.0]).collect();
+    let mut cutter = Cutter::new(30.0);
+    for p in &pts {
+        cutter.push((p[0] as f32, p[1] as f32), SelectionMode::Replace);
+    }
+    cutter.finish();
+    let live: Vec<Value> = cutter.closed().iter().map(|&(n, _)| json!(n)).collect();
+    for segments in [None, Some(json!([1, 8])), Some(json!([1, 2, 2, 2, 2])), Some(json!([1, 1, 1, 1, 1, 1, 1, 1, 1])), Some(json!(live))] {
+        let mut s = square_doc();
+        let mut p = json!({"points": pts, "size": 30, "mode": "replace"});
+        if let Some(seg) = &segments {
+            p["segments"] = seg.clone();
+        }
+        s.execute("select.quick", p).unwrap();
+        let (i, o) = in_square(&s);
+        assert!(i >= 300 * 300 - 10 && o == 0, "segments {segments:?}: {i} in, {o} out");
+    }
+    // A click alone still takes about the brush.
+    let mut s = square_doc();
+    s.execute("select.quick", json!({"points": [[250, 250]], "size": 30})).unwrap();
+    assert!(in_square(&s).0 < 2000);
+}
+
+#[test]
+fn the_cut_follows_the_pointer_travel_not_the_timing() {
+    let travel = segment_travel(30.0);
+    assert_eq!(travel, 37.5);
+    assert_eq!(segment_travel(4.0), MIN_TRAVEL);
+    // The press is a segment of its own; then one segment per `travel` of the pointer, however
+    // finely the moves arrive.
+    let cut = |step: f32| {
+        let mut c = Cutter::new(30.0);
+        let mut x = 0.0;
+        while x <= 300.0 {
+            c.push((x, 10.0), SelectionMode::Add);
+            x += step;
+        }
+        c.finish();
+        c.closed().to_vec()
+    };
+    for step in [2.5, 7.5, 12.5] {
+        let segs = cut(step);
+        assert_eq!(segs[0], (1, SelectionMode::Add), "step {step}");
+        // Each closed segment but the last spans the travel (to within one move).
+        let mut at = 1usize;
+        for &(n, _) in &segs[1..segs.len() - 1] {
+            let span = n as f32 * step;
+            assert!(span >= travel && span < travel + step, "step {step}: {span}");
+            at += n;
+        }
+        assert_eq!(at + segs.last().unwrap().0, (300.0 / step) as usize + 1);
+    }
+    // A mode change ends the open segment before the point painted in the new mode.
+    let mut c = Cutter::new(30.0);
+    for (x, m) in [(0.0, SelectionMode::Add), (5.0, SelectionMode::Add), (10.0, SelectionMode::Subtract), (15.0, SelectionMode::Subtract)] {
+        c.push((x, 0.0), m);
+    }
+    c.finish();
+    assert_eq!(c.closed(), &[(1, SelectionMode::Add), (1, SelectionMode::Add), (2, SelectionMode::Subtract)]);
+    // Capped: the rest of a very long stroke is its last segment.
+    let mut c = Cutter::new(1.0);
+    for i in 0..(MAX_SEGMENTS * 2) {
+        c.push((i as f32 * 100.0, 0.0), if i % 2 == 0 { SelectionMode::Add } else { SelectionMode::Subtract });
+    }
+    c.finish();
+    assert_eq!(c.closed().len(), MAX_SEGMENTS);
+    assert_eq!(c.closed().iter().map(|s| s.0).sum::<usize>(), MAX_SEGMENTS * 2);
+}
+
+#[test]
+fn a_later_replace_segment_adds_and_keeps_the_strokes_subtraction() {
+    // New mode with ⌥ held at the press, ⌥ let go during the drag: the stroke subtracts, then
+    // its New segments add; they must not replace the selection with their own region.
+    let run = |last: &str| {
+        let mut s = square_doc();
+        s.execute("select.all", json!({})).unwrap();
+        let p = json!({"points": [[40, 40], [40, 60], [40, 460]], "size": 30, "mode": "subtract", "segments": [1, 1, {"points": 1, "mode": last}]});
+        s.execute("select.quick", p).unwrap();
+        s
+    };
+    let (replace, add) = (run("replace"), run("add"));
+    assert_eq!(sel_bytes(&replace), sel_bytes(&add), "a New segment after the stroke has found something adds");
+    let selected = sel_bytes(&replace).iter().filter(|c| **c >= 128).count();
+    assert!(selected > 200_000 && cov(&replace, 250, 250) >= 0.99, "{selected}: Select All's rest stays, not replaced by a band");
+    let subtracted_only = {
+        let mut s = square_doc();
+        s.execute("select.all", json!({})).unwrap();
+        s.execute("select.quick", json!({"points": [[40, 40], [40, 60]], "size": 30, "mode": "subtract", "segments": [1, 1]})).unwrap();
+        sel_bytes(&s).iter().filter(|c| **c >= 128).count()
+    };
+    assert!(subtracted_only < 250_000, "the subtracting segments took something out");
+}
+
+#[test]
+fn a_replayed_stroke_is_capped_and_can_be_cancelled() {
+    let n = MAX_SEGMENTS + 1;
+    let pts: Vec<[f64; 2]> = (0..n).map(|i| [(i % 140) as f64, 50.0]).collect();
+    let mut s = two_regions(8);
+    assert!(s.execute("select.quick", json!({"points": pts, "segments": vec![1; n]})).is_err(), "more segments than the cap");
+    // Cancelled between segments: an error, and the selection untouched.
+    let ctx = crate::jobs::JobCtx::new();
+    ctx.cancel();
+    s.set_inline_job_ctx(Some(ctx));
+    let r = s.execute("select.quick", json!({"points": [[20, 50], [30, 50]], "segments": [1, 1]}));
+    assert!(matches!(r, Err(EngineError::Cancelled)), "{r:?}");
+    assert!(s.active().unwrap().doc.selection.is_none());
+    s.set_inline_job_ctx(None);
+    assert!(s.execute("select.quick", json!({"points": [[20, 50], [30, 50]], "segments": [1, 1]})).is_ok());
+}

@@ -322,8 +322,9 @@ pub enum Started {
     Job(JobId),
 }
 
-/// Commands that never edit the active document, allowed while a job runs on it.
-fn independent_of_document(id: &str) -> bool {
+/// Commands that never edit the active document, allowed while a job runs on it (and run at once
+/// while a Quick Selection stroke is still being committed).
+pub fn independent_of_document(id: &str) -> bool {
     const PREFIXES: &[&str] = &["jobs.", "tools.", "view.", "window.", "help.", "brush.presets.", "gradient.presets."];
     const IDS: &[&str] = &["file.new", "file.close", "file.closeAll", "edit.preferences", "edit.colorSettings", "edit.keyboardShortcuts", "edit.menus"];
     PREFIXES.iter().any(|p| id.starts_with(p)) || IDS.contains(&id)

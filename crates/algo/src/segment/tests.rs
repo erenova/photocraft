@@ -365,8 +365,8 @@ fn quick_select_cuts_window_sizes_in_parallel_with_the_same_result() {
     ];
     let mut most = 0;
     for (pts, size) in strokes {
-        let one = quick::quick_select_batched::<true>(&s, canvas, pts, size, &t, 1);
-        let many = quick::quick_select_batched::<true>(&s, canvas, pts, size, &t, 4);
+        let one = quick::quick_select_batched::<true>(&s, canvas, pts, &[], size, &t, 1);
+        let many = quick::quick_select_batched::<true>(&s, canvas, pts, &[], size, &t, 4);
         assert_eq!(one.as_ref().map(|(r, n)| (r.bbox, &r.mask, n)), many.as_ref().map(|(r, n)| (r.bbox, &r.mask, n)), "{pts:?} size {size}");
         most = most.max(one.map_or(0, |(_, n)| n));
     }
@@ -541,6 +541,44 @@ fn quick_select_a_short_drag_takes_what_a_click_does_not() {
     assert!(count(&qs(&img, &[(250.0, 250.0)], 30.0)) < 2000);
     let (i, o) = inside_outside(&qs(&img, &[(220.0, 250.0), (280.0, 250.0)], 30.0), (100, 100, 400, 400));
     assert!(i >= 300 * 300 - 10 && o == 0, "{i} in, {o} out");
+}
+
+#[test]
+fn quick_select_a_short_drag_cut_into_segments_still_takes_the_square() {
+    // A live stroke is selected segment by segment, each seeded by the stroke so far (#9145): the
+    // 60 px drag above takes the whole square however it is cut, as one stroke does in Photoshop,
+    // while a segment seeded by its own points alone takes about the brush band.
+    let img = qs_square(500, 300, QS_RED, QS_BLUE);
+    let s = ImageSampler { img: &img, origin: (0, 0) };
+    let canvas = Rect::new(0, 0, 500, 500);
+    let pts: Vec<(f32, f32)> = (0..9).map(|i| (220.0 + 7.5 * i as f32, 250.0)).collect();
+    for cut in [vec![1, 1, 1, 1, 1, 1, 1, 1, 1], vec![1, 2, 2, 2, 2], vec![1, 8], vec![9]] {
+        let (mut inside, mut outside) = (vec![false; 500 * 500], 0);
+        let mut lines: Vec<Vec<(f32, f32)>> = Vec::new();
+        let mut at = 0usize;
+        for n in &cut {
+            let mut line: Vec<(f32, f32)> = at.checked_sub(1).map(|i| pts[i]).into_iter().collect();
+            line.extend_from_slice(&pts[at..at + n]);
+            let context: Vec<&[(f32, f32)]> = lines.iter().map(Vec::as_slice).collect();
+            if let Some(r) = quick::quick_select_in_stroke(&s, canvas, &line, &context, 30.0) {
+                for y in r.bbox.y0..r.bbox.y1 {
+                    for x in r.bbox.x0..r.bbox.x1 {
+                        if r.at(x, y) >= 0.5 {
+                            if (100..400).contains(&x) && (100..400).contains(&y) {
+                                inside[(y * 500 + x) as usize] = true;
+                            } else {
+                                outside += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            lines.push(line);
+            at += n;
+        }
+        let i = inside.iter().filter(|v| **v).count();
+        assert!(i >= 300 * 300 - 10 && outside == 0, "cut {cut:?}: {i} in, {outside} out");
+    }
 }
 
 #[test]

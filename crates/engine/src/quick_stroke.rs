@@ -3,20 +3,27 @@
 //! Photoshop's Quick Selection grows the selection under the brush while the button is held: the
 //! outline follows the pointer and spreads to the edges near it (Adobe Help, "Paint a selection
 //! with Quick Selection tool"). Recomputing the whole stroke on every pointer move costs more
-//! the longer the stroke gets, so a stroke is selected **segment by segment**: each segment (the
-//! points that arrived since the previous one, joined to that one's last point) is grown on its
-//! own by [`quick_select`](photocraft_algo::segment::quick::quick_select) and combined into the selection as it stands, in order. An
-//! update costs what its new segment costs, however long the stroke already is.
+//! the longer the stroke gets, so a stroke is selected **segment by segment**: each segment (its
+//! points, joined to the previous segment's last point) is grown by
+//! [`quick_select_in_stroke`](photocraft_algo::segment::quick::quick_select_in_stroke) in a
+//! working window around itself, seeded by the stroke painted so far wherever that falls in the
+//! window, and combined into the selection as it stands, in order. An update costs what its new
+//! segment covers, however long the stroke already is, and the stroke takes what it takes as one:
+//! a short drag inside an object too big for a click selects the object (measured in Photoshop,
+//! `quick_select_a_short_drag_takes_what_a_click_does_not`), however it was cut.
 //!
-//! `select.quick` records how its stroke was cut (`segments`), and computes exactly these
-//! segments in this order, so the selection shown while dragging ([`QuickStroke`], driven by the
-//! shell off the UI thread), the one committed on release and the one a replay of the journal
-//! makes are the same. Without `segments` the whole stroke is one segment, as before.
+//! A live stroke is cut by the pointer's travel alone ([`Cutter`]), never by how long a segment
+//! takes to grow, so the same motion gives the same selection on any machine. `select.quick`
+//! records the cut (`segments`) and computes exactly these segments in this order, so the
+//! selection shown while dragging ([`QuickStroke`], driven by the shell off the UI thread), the
+//! one committed on release and the one a replay of the journal makes are the same. Without
+//! `segments` the whole stroke is one segment, as before.
 //!
-//! Modes: a segment adds, subtracts or replaces. A stroke replaces the old selection once, with
-//! the first segment that finds anything; its later `replace` segments add to that (a New
-//! Selection stroke keeps growing as it is painted). Each segment carries its own mode, so ⌥
-//! pressed or let go during a drag subtracts (or adds again) from that point of the stroke on.
+//! Modes: a segment adds, subtracts or replaces. A stroke replaces the old selection only with
+//! its first segment that finds anything; every later `replace` segment adds (a New Selection
+//! stroke keeps growing as it is painted, and never wipes what the stroke itself did). Each
+//! segment carries its own mode, so ⌥ pressed or let go during a drag subtracts (or adds again)
+//! from that point of the stroke on.
 
 use std::sync::Arc;
 
@@ -28,9 +35,94 @@ use serde_json::{Value, json};
 
 use crate::{EngineError, Result, Session};
 
-/// Most segments one stroke may be cut into: a live drag adds at most one per frame, so this is
-/// many minutes of dragging.
-pub const MAX_SEGMENTS: usize = 100_000;
+/// Most segments one stroke may be cut into: a live drag adds one per [`segment_travel`] of the
+/// pointer, so this is a drag of over 100,000 px with a small brush. Every segment is a
+/// segmentation, so a replayed or scripted stroke can't ask for an unbounded number.
+pub const MAX_SEGMENTS: usize = 4096;
+
+/// The shortest travel (document px) that ends a live segment, whatever the brush.
+pub const MIN_TRAVEL: f32 = 24.0;
+
+/// How far the pointer travels (document px) before a live stroke's segment ends: a little more
+/// than the brush width (each segment costs a segmentation in a window around it, so a brush
+/// width or so of new stroke per update keeps the outline close behind the pointer without
+/// falling behind on a large document).
+pub fn segment_travel(size: f32) -> f32 {
+    let size = if size.is_finite() { size } else { 30.0 };
+    (1.25 * size).max(MIN_TRAVEL)
+}
+
+/// Cuts a live stroke into segments as its points arrive, by the pointer's travel alone: the
+/// press is a segment of its own (a click selects at once), then a segment ends at the first
+/// point where the pointer has travelled [`segment_travel`] since it began, or before a point
+/// painted in another mode (a modifier pressed or let go). The same motion gives the same cut on
+/// any machine; the cut is capped at [`MAX_SEGMENTS`], the rest being the last segment.
+#[derive(Clone, Debug)]
+pub struct Cutter {
+    travel: f32,
+    points: usize,
+    /// Where the open segment starts, and its mode.
+    open: usize,
+    open_mode: Option<SelectionMode>,
+    /// The pointer's travel since the open segment's start (the previous segment's last point).
+    moved: f32,
+    last: Option<(f32, f32)>,
+    closed: Vec<(usize, SelectionMode)>,
+}
+
+impl Cutter {
+    /// A cutter for a stroke with brush diameter `size`.
+    pub fn new(size: f32) -> Self {
+        Self { travel: segment_travel(size), points: 0, open: 0, open_mode: None, moved: 0.0, last: None, closed: Vec::new() }
+    }
+
+    fn at_cap(&self) -> bool {
+        self.closed.len() + 1 >= MAX_SEGMENTS
+    }
+
+    fn close(&mut self) {
+        if let Some(m) = self.open_mode.filter(|_| self.points > self.open) {
+            self.closed.push((self.points - self.open, m));
+            self.open = self.points;
+            self.moved = 0.0;
+        }
+    }
+
+    /// The stroke's next point `p` (finite, document px), painted in `mode`.
+    pub fn push(&mut self, p: (f32, f32), mode: SelectionMode) {
+        if self.open_mode.is_some_and(|m| m != mode) && !self.at_cap() {
+            self.close();
+        }
+        if self.points == self.open || self.open_mode.is_none() {
+            self.open_mode = Some(mode);
+        }
+        if let Some(l) = self.last {
+            let d = (p.0 - l.0).hypot(p.1 - l.1);
+            self.moved += if d.is_finite() { d } else { 0.0 };
+        }
+        self.last = Some(p);
+        self.points += 1;
+        if !self.at_cap() && (self.points == 1 || self.moved >= self.travel) {
+            self.close();
+        }
+    }
+
+    /// The stroke ended: its open points become the last segment.
+    pub fn finish(&mut self) {
+        self.close();
+    }
+
+    /// The segments closed so far: point counts (adding up to the points before the open ones)
+    /// and modes.
+    pub fn closed(&self) -> &[(usize, SelectionMode)] {
+        &self.closed
+    }
+
+    /// Points pushed so far.
+    pub fn points(&self) -> usize {
+        self.points
+    }
+}
 
 /// The brush diameter range `select.quick` works with (px).
 const SIZE: std::ops::RangeInclusive<f32> = 1.0..=5000.0;
@@ -159,9 +251,10 @@ impl QuickSource {
         self.base == o.base && self.layer == o.layer && self.all_layers == o.all_layers && self.size.to_bits() == o.size.to_bits() && self.enhance == o.enhance
     }
 
-    /// The region one segment (`pts`, a polyline) grows to, or `None` when it misses the canvas.
-    pub fn region(&self, pts: &[(f32, f32)]) -> Option<Region> {
-        crate::smartselect_cmds::quick_region(&self.doc, self.layer, self.all_layers, pts, self.size, self.enhance)
+    /// The region one segment (`pts`, a polyline) grows to, seeded by the stroke's earlier
+    /// polylines `context` too, or `None` when it misses the canvas.
+    pub fn region(&self, pts: &[(f32, f32)], context: &[&[(f32, f32)]]) -> Option<Region> {
+        crate::smartselect_cmds::quick_region(&self.doc, self.layer, self.all_layers, pts, context, self.size, self.enhance)
     }
 }
 
@@ -172,8 +265,10 @@ pub struct QuickStroke {
     selection: Option<Surface>,
     /// The previous segment's last point: the next segment starts from it.
     last: Option<(f32, f32)>,
-    /// A segment has replaced the old selection (later `replace` segments add).
-    replaced: bool,
+    /// A segment has found something: a later `replace` segment adds.
+    applied: bool,
+    /// Every segment's polyline, and whether it subtracts: the seeds of later segments of its kind.
+    lines: Vec<(bool, Vec<(f32, f32)>)>,
     /// A segment found something.
     changed: bool,
     /// Everything the segments found.
@@ -185,7 +280,7 @@ pub struct QuickStroke {
 impl QuickStroke {
     /// A stroke starting from the selection `base`.
     pub fn new(base: Option<Surface>) -> Self {
-        Self { selection: base, last: None, replaced: false, changed: false, bounds: Rect::EMPTY, points: Vec::new(), segments: Vec::new() }
+        Self { selection: base, last: None, applied: false, lines: Vec::new(), changed: false, bounds: Rect::EMPTY, points: Vec::new(), segments: Vec::new() }
     }
 
     /// Select the next segment, `pts` (non-finite points are skipped), in `mode`. Returns the
@@ -199,10 +294,19 @@ impl QuickStroke {
         self.last = Some(end);
         self.points.extend_from_slice(&pts);
         self.segments.push((pts.len(), mode));
-        let Some(region) = src.region(&line) else { return Rect::EMPTY };
-        let m = if mode == SelectionMode::Replace && self.replaced { SelectionMode::Add } else { mode };
+        // Seeded by the stroke so far: its segments that select (or subtract) like this one.
+        let subtracts = mode == SelectionMode::Subtract;
+        let region = {
+            let context: Vec<&[(f32, f32)]> = self.lines.iter().filter(|(s, _)| *s == subtracts).map(|(_, l)| l.as_slice()).collect();
+            src.region(&line, &context)
+        };
+        self.lines.push((subtracts, line));
+        let Some(region) = region else { return Rect::EMPTY };
+        // Only the stroke's first segment that finds anything replaces: a later one adds, so it
+        // never wipes what the stroke did before it (a subtraction with ⌥ held, say).
+        let m = if mode == SelectionMode::Replace && self.applied { SelectionMode::Add } else { mode };
         self.selection = combine_region(self.selection.as_ref(), Some(&region), m);
-        self.replaced |= mode == SelectionMode::Replace;
+        self.applied = true;
         self.changed = true;
         self.bounds = self.bounds.union(&region.bbox);
         region.bbox
@@ -236,25 +340,6 @@ impl QuickStroke {
         let segments: Vec<Value> = self.segments.iter().map(|&(n, m)| if m == mode { json!(n) } else { json!({"points": n, "mode": mode_name(m)}) }).collect();
         let points: Vec<[f64; 2]> = self.points.iter().map(|&(x, y)| [f64::from(x), f64::from(y)]).collect();
         json!({"points": points, "segments": segments, "mode": mode_name(mode)})
-    }
-
-    /// Select the stroke `pts` cut into `segments` (as [`segments`] reads them) from `base`.
-    pub fn run(
-        src: &QuickSource,
-        base: Option<Surface>,
-        pts: &[(f32, f32)],
-        segments: &[(usize, SelectionMode)],
-        check: &dyn Fn() -> Result<()>,
-    ) -> Result<Self> {
-        let mut stroke = Self::new(base);
-        let mut at = 0usize;
-        for &(n, m) in segments {
-            check()?;
-            let end = at.saturating_add(n).min(pts.len());
-            stroke.push(src, pts.get(at..end).unwrap_or_default(), m);
-            at = end;
-        }
-        Ok(stroke)
     }
 }
 
@@ -299,15 +384,38 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let segments = segments(p, pts.len())?;
     let src = QuickSource::new(s, p)?;
-    let live = offered.and_then(|c| c.take_if(&src, &pts, &segments));
-    let from_live = live.is_some();
-    let stroke = match live {
-        Some(stroke) => stroke,
-        None => QuickStroke::run(&src, src.selection().cloned(), &pts, &segments, &|| Ok(()))?,
-    };
+    if let Some(stroke) = offered.and_then(|c| c.take_if(&src, &pts, &segments)) {
+        return commit(s, stroke, true);
+    }
+    // Grown here: a background job where the shell runs those (a scripted or replayed stroke of
+    // many segments shows progress and can be cancelled between segments).
+    let base = src.selection().cloned();
+    crate::jobs::run(
+        s,
+        "Quick Selection",
+        true,
+        move |ctx| {
+            let total = segments.len().max(1) as f32;
+            let mut stroke = QuickStroke::new(base);
+            let mut at = 0usize;
+            for (k, &(n, m)) in segments.iter().enumerate() {
+                ctx.check()?;
+                ctx.progress(k as f32 / total, "Selecting");
+                let end = at.saturating_add(n).min(pts.len());
+                stroke.push(&src, pts.get(at..end).unwrap_or_default(), m);
+                at = end;
+            }
+            Ok(stroke)
+        },
+        move |s, stroke| commit(s, stroke, false),
+    )
+}
+
+/// Store a grown stroke's selection as one history step ("Quick Selection"); a stroke that found
+/// nothing leaves the selection (and history) alone.
+fn commit(s: &mut Session, stroke: QuickStroke, from_live: bool) -> Result<Value> {
     if !stroke.changed {
-        // Nothing found: the selection (and history) is left alone.
-        let selected = src.selection().is_some();
+        let selected = s.active().ok_or(EngineError::NoDocument)?.doc.selection.is_some();
         return Ok(json!({"selected": selected, "changed": false}));
     }
     let b = stroke.bounds;
