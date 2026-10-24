@@ -78,8 +78,9 @@ From STATUS.md, in board order, take the first row whose state is:
 
 1. `changes-requested` (an upstream reviewer asked for changes: these come first), else
 2. `todo`, else
-3. `in-progress` whose *Updated* time is more than 4 hours old (a dead session: take it over and
-   continue from the branch it pushed).
+3. `in-progress` whose *Updated* time is more than 4 hours old **and** whose branch on `origin`
+   has no commit from the last 2 hours (a dead session: take it over and continue from the
+   branch it pushed).
 
 Skip `blocked`, `ready-for-pr`, `pr-open`, `merged`, `upstream-fixed`, `dropped`, and any
 `in-progress` row updated within 4 hours (another session owns it). If nothing is left, go to §7.
@@ -122,6 +123,11 @@ Then `git ls-tree -d HEAD prompts | grep -q . && echo "STOP: prompts/ must not b
 
 Give a `general-purpose` subagent this prompt, filled in. Run one task at a time: the VM has
 about 4 cores, 16 GB of RAM and 30 GB of disk, and parallel cargo builds would fight over them.
+
+While the implementer works, the checkout has uncommitted changes, and the cloud session's stop
+hook asks you to commit them each time your turn ends. That is expected: don't commit them (the
+implementer owns the working tree and commits once it builds), say so in one line and carry
+on. Never edit, disable or debug hooks, `.claude/` settings or the cloud environment.
 
 > You are a senior Rust engineer fixing one PhotoCraft bug so that it behaves exactly like
 > Photoshop 2026. Work in `<repo path>` on branch `claude/fix-NN-slug` (already checked out).
@@ -176,7 +182,9 @@ cost the next agent the same (a build trick, a flaky test, a reviewer preference
 in a task file). If a task file misled you, fix the task file. Keep LEARNINGS.md under 150 lines:
 merge and delete stale lessons instead of piling up.
 
-**Follow up on PRs the owner opened**, when the API is reachable. For a `ready-for-pr` row, look
+**Follow up on PRs the owner opened.** If `api.github.com` answers 403 (the cloud proxy blocks
+it), skip the commands below: the owner sets `pr-open #N` and `changes-requested` by hand, with
+the reviewer's requests pasted into *Notes*. Otherwise: For a `ready-for-pr` row, look
 for its PR: `curl -fsS "https://api.github.com/repos/storytold/photocraft/pulls?state=all&head=erenova:claude/fix-NN-slug"`;
 if there is one, set the row to `pr-open #N`. For `pr-open #N` rows:
 
@@ -221,5 +229,7 @@ loop.
 - Never put personal details in requests (User-Agent, headers, URLs). Use `Photocraft-dev` as the
   User-Agent when fetching assets.
 - Never commit fonts, corpus files, personal photos, secrets or build output.
-- Disk: if free space drops under 6 GB, `cargo clean` and rebuild only what the task needs.
+- Disk: run cargo with `CARGO_INCREMENTAL=0` unless the environment already sets it (incremental
+  data alone can reach 11 GB). If free space drops under 6 GB, delete `target/*/incremental`
+  first, then `cargo clean` if that isn't enough, and rebuild only what the task needs.
 - Report honestly: a test you didn't run is "not run", never "passed".

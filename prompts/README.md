@@ -36,14 +36,18 @@ git switch main                               # back to normal
 
 1. Open https://claude.ai/code, connect GitHub, and give the Claude GitHub app access to
    `erenova/photocraft`.
-2. Create an **environment** (environment settings in the session dialog):
+2. Create an **environment**. This is a settings form (the environment picker when you start a
+   session → add or edit an environment), **not** a chat message. Fill it in once, save it, and
+   pick it every time you start a session; the chat only ever gets the start prompt (step 3).
    - **Network access:** Trusted (the default; it allows GitHub, crates.io and the Rust and
      Ubuntu package servers).
    - **Environment variables:**
      ```
      BASH_DEFAULT_TIMEOUT_MS=600000
      BASH_MAX_TIMEOUT_MS=1800000
+     CARGO_INCREMENTAL=0
      ```
+     The last one keeps the build folder small enough for the VM's 30 GB disk.
    - **Setup script:**
      ```bash
      #!/bin/bash
@@ -97,6 +101,13 @@ Routines push only to `claude/…` branches by default, which is exactly what th
 Turn a routine off with its switch on the routines page. Don't run A and B at the same time at
 first: the board's lock keeps them off each other's task, but you'd pay twice.
 
+### Messages you can ignore
+
+- **"Uncommitted changes" / the stop hook asking to commit.** Cloud sessions remind Claude to
+  commit whenever it pauses. While a subagent is mid-edit, the loop correctly leaves those
+  changes for the subagent to commit. Nothing to fix.
+- **"GitHub API is blocked (403)".** Expected on the cloud VM; see section 5, step 4.
+
 ## 4. Watch it
 
 - The board: https://github.com/erenova/photocraft/blob/claude/loop/prompts/STATUS.md
@@ -115,13 +126,15 @@ When a row on the board says `ready-for-pr`:
 3. **Fill it in.** Copy the title and description from `prs/NN-*.md` on the `claude/loop`
    branch. Drag the PNG screenshots from `prs/NN-*/` into the description box. Press
    **Create pull request**.
-4. **Wait for the checks.** CI builds and tests it (a green tick when it passes). Maintainers
-   and review bots comment. The loop notices your PR by its branch name and marks the row
-   `pr-open #N`.
-5. **Changes requested?** The loop picks it up (`changes-requested`), fixes the branch and
-   pushes; the PR updates by itself. Reply to the reviewer when it's done, e.g. "Addressed in
-   the latest push, thanks!"
-6. **Merged?** Done. You can delete the branch on GitHub (the loop never deletes branches).
+4. **Tell the board.** The cloud VM can't read GitHub's API, so the loop can't see your PR.
+   Edit the row's state to `pr-open #N` (N = the PR number), see section 6.
+5. **Wait for the checks.** CI builds and tests it (a green tick when it passes). Maintainers
+   and review bots comment.
+6. **Changes requested?** Set the row to `changes-requested` and paste what the reviewer asked
+   into its *Notes*. The loop picks it up first, fixes the branch and pushes; the PR updates by
+   itself. Reply to the reviewer when it's done, e.g. "Addressed in the latest push, thanks!"
+7. **Merged?** Set the row to `merged`. You can delete the branch on GitHub (the loop never
+   deletes branches).
 
 Same thing from the terminal, if you prefer:
 
