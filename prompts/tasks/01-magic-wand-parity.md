@@ -1,12 +1,13 @@
-# 01 · Magic Wand selects like Photoshop's: clean edges, Sample Size, exact modifiers
+# 01 · Magic Wand: drag to widen the selection, clean edges, Sample Size, exact modifiers
 
 - **Upstream issues:** storytold/photocraft#4902 (tolerance "doesn't fully grab an item … leaves
   a trace of the selected line behind", and the more you use it on the same item, the more you
   lose), #9145 ("Magic Wand is also hard to control"; Alt is taken by the Linux window manager),
   #5775 (clicking inside the selection doesn't deselect)
 - **Branch:** `claude/fix-01-magic-wand-parity`
-- **Suggested PR title:** `Magic Wand: in-tolerance pixels stay fully selected, and Sample Size, as in Photoshop (#4902)`
-- **Time box:** 6 hours.
+- **Suggested PR title:** `Magic Wand: drag to widen the selection, in-tolerance pixels stay fully selected, and Sample Size (#4902)`
+- **Time box:** 8 hours. **The drag behaviour below is the owner's top request for this tool: do it
+  first.**
 
 ## The report
 
@@ -15,9 +16,50 @@ Try `curl -L -A Photocraft-dev -o /tmp/4902.mp4 <url>` and look at frames
 (`ffmpeg -i /tmp/4902.mp4 -vf fps=2 /tmp/4902-%03d.png`, then read the PNGs). If the download is
 blocked, work from the text and the hypotheses below.
 
-The fork's owner also expected dragging with the wand to grow the selection. **Photoshop doesn't
-do that** (see the spec): the drag-to-grow tool is Quick Selection, task 00. Don't add
-drag behaviour to the Magic Wand.
+## The owner's requirement: drag to widen (build this)
+
+The fork's owner works like this: press **W**, hold **Shift**, press the mouse on the
+background, and **move the mouse while it's held**. The wand's selection widens as the mouse
+moves away and narrows as it comes back, still by colour, so "stricter than Quick Selection".
+Let go, Shift-press elsewhere and drag again to add more. Today PhotoCraft's wand selects on the
+press and ignores the drag, which "makes the tool useless" for them.
+
+Photoshop's wand ignores drags (spec point 1), so this goes beyond Photoshop. It's the
+**drag-to-adjust-tolerance** gesture of Pixelmator's Magic Wand, GIMP's Fuzzy Select and
+Affinity Photo's Flood Select. In Photoshop a drag with the wand does the same as a click, so
+adding this breaks no Photoshop habit. Rules:
+
+1. **A click is unchanged.** Press and release within a few screen pixels (use the app's
+   existing click/drag threshold) = Photoshop's click, at the options-bar Tolerance.
+2. **Press and drag:** the selection appears at the press at the options-bar Tolerance, then the
+   tolerance follows the pointer: moving right or down raises it, left or up lowers it
+   (tolerance = base + k × (dx + dy) in screen points, clamped to 0–255, `k` chosen so about 300
+   points of travel spans the full range; tune it by feel in a snapshot test and say what you
+   chose). The seed stays where the press was.
+3. **Live:** the marching ants update while dragging, at least 10 times a second on a 24 MP image
+   on the VM, and the UI thread never stalls more than a frame. Base this branch on upstream
+   `main`, not on task 00's unfinished branch. That branch
+   (`claude/fix-00-quick-selection-live`, `crates/ui-egui/src/quick_select_ui.rs`) has a
+   background worker, outline tracing and a frame-clock throttle for live selections: borrow the
+   design, avoid what its reviews rejected (`prompts/notes/00-quick-selection-live/reviews.md`:
+   no command-deferral queue; while a result is pending, edits get the standard job refusal),
+   and keep your piece small and shaped so both tools can share it later. The wand's span fill
+   is much cheaper than Quick Selection's segmentation, so the preview may simply recompute the
+   whole fill at the new tolerance on each throttled update.
+4. **The options-bar Tolerance field shows the live value** while dragging, and keeps the final
+   value after release, so the next click uses it.
+5. **Modifiers work as for clicks**, read at the press: Shift adds the growing area to the
+   existing selection (the preview shows existing + new), Alt subtracts, Shift+Alt intersects,
+   no key replaces (or follows the mode buttons).
+6. **Commit on release** as `select.magicWand` with the final tolerance: one history step,
+   "Magic Wand", replayable from the journal. What's shown at release is what's committed. Esc
+   during the drag cancels and leaves the selection as it was.
+7. **A preference** (Preferences › Tools: "Magic Wand: drag to adjust Tolerance", on by default),
+   so upstream maintainers can accept it as an option beside Photoshop's behaviour. Say all of
+   this plainly in the PR text: "beyond Photoshop; a click is unchanged".
+
+Also look at upstream PR #3919 (re-runs the last click when the Tolerance field changes): don't
+take its field behaviour (spec point 6), but its re-run-from-the-same-seed code may help.
 
 ## Photoshop behaviour (the spec)
 
@@ -90,13 +132,23 @@ unreachable from the VM; this is what they describe.
   place. If not, change both copies the same way and mention #8582 in the PR text.
 - **PR #5851** makes a New-mode click inside the selection deselect. That contradicts spec
   point 8: don't take it. Say why in the PR text.
-- **PR #3919** re-runs the last click when Tolerance changes. Not Photoshop (spec point 6): don't
-  take it.
+- **PR #3919** re-runs the last click when the Tolerance field changes. Not Photoshop (spec
+  point 6): don't take that field behaviour (its same-seed re-run code may help the drag).
 - **PR #2995** bundles a Magic Wand Sample Size with an AI model. Take nothing from it except, if
   useful, the shape of the Sample Size option.
 
 ## Acceptance criteria
 
+- [ ] **Drag to widen:** a ui-egui harness test presses the wand on a synthetic image with a
+      colour ramp, drags right, and asserts the selection is larger at a later mid-drag frame
+      than at the press, narrower again after dragging back, and that release commits exactly
+      the last preview as one `select.magicWand` step with the final tolerance. Shift-drag adds
+      to an existing selection; Esc cancels; a click with no drag gives the same result as
+      before this change.
+- [ ] Drag numbers in the PR text: preview updates per second and the longest UI-thread frame
+      on a 24 MP image.
+- [ ] Snapshot PNGs of a wand drag mid-way and after release, with the Tolerance field showing
+      the live value.
 - [ ] A failing-before test for the cause you confirmed (H1 at least): wand click with
       Anti-alias on a flat-colour shape, then `edit.clear`, leaves zero ink of that colour.
 - [ ] Repeated clicks on the same pixel give identical selections (New and Add modes).
@@ -126,4 +178,4 @@ cargo xtask parity      # if a command or param was added
 
 ## Out of scope
 
-Drag behaviour (Photoshop has none). Quick Selection (task 00). Select Subject quality.
+Quick Selection (task 00). Select Subject quality.

@@ -13,9 +13,10 @@ rules in this file, write the decision and the reason into the board's *Notes*, 
 Stop only when §7 says the board is empty.
 
 **The owner's use of PhotoCraft:** product images for their brand, AI-generated PNGs. They
-select the background (Magic Wand on the corners, Quick Selection, Select Subject, Remove
-Background), delete it, clean the edges and export a transparent PNG, as they do in Photoshop
-and Photopea. Anything that breaks that flow outranks everything except crashes.
+select the background (mostly the Magic Wand: Shift held, press on a corner and **drag to widen
+the selection**; also Quick Selection, Select Subject, Remove Background), delete it, clean the
+edges and export a transparent PNG, as they do in Photoshop and Photopea. Anything that breaks
+that flow outranks everything except crashes.
 
 **Subagents** run on Opus: pass `model: "opus"` when you launch one (implementer, reviewer,
 researcher), and use the `general-purpose` type.
@@ -24,7 +25,10 @@ researcher), and use the `general-purpose` type.
 
 **PhotoCraft must behave like Photoshop 2026**: the same tools, modifiers, options-bar controls,
 menus, shortcuts, results and file fidelity, only faster. When a bug report asks for something
-Photoshop doesn't do, the fix is Photoshop's behaviour, not the reporter's wish. Read `AGENTS.md`
+Photoshop doesn't do, the fix is Photoshop's behaviour, not the reporter's wish. **The one
+exception is what a task file lists under "The owner's requirement"** (task 01's drag to widen):
+build it as an addition that leaves Photoshop's behaviour intact, behind a preference that is on
+by default, and say so in the PR text. Read `AGENTS.md`
 in the repository root: it is the project's law (never crash, everything is a command, clean-room,
 tests are the gate, never break wasm). These prompts add to it and never override it.
 
