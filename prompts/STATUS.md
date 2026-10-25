@@ -10,6 +10,7 @@ The loop (`prompts/LOOP.md`) reads and updates this table. Times are UTC.
 | 03 | [Remove Background cuts out product shots](tasks/03-remove-background-products.md) | #9145, #2788 | todo | | 2026-10-24T19:00Z | Model-free path |
 | 04 | [Repeated pastes don't crash; recovery is current](tasks/04-paste-crash-recovery.md) | #7582 | todo | | 2026-10-24T19:00Z | Critical upstream |
 | 05 | [Smart filters reopen, edit and delete again](tasks/05-smart-filters-reopen.md) | #9055 | todo | | 2026-10-24T19:00Z | Regression since 0.13 |
+| 06 | [Convert to Smart Object acts on the layer it's given; perf --quick passes](tasks/06-convert-smart-object-target.md) | (none filed) | todo | | 2026-10-25T03:20Z | Found while running task 00's gates: layout_bench panics on upstream/main, likely smart_cmds.rs:1385 checking the active layer instead of the `layer` param |
 
 ## States
 
