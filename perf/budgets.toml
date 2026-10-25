@@ -612,3 +612,77 @@ bench = "bench_filters2"
 row = "Reduce Noise"
 budget_ms = 1000
 enforce = false  # 2.8 s measured 2026-10-22
+
+# ---- #9145: Quick Selection grows while you drag ----------------------------------------------
+#
+# The real app in an offscreen harness on a 24 MP document, pointer moves at 60 Hz in real time
+# (segments grow on their worker meanwhile). Frames are the UI thread's work for one frame; the
+# budget is one frame at 60 Hz. The outline should update at least ten times a second with a
+# 30 px brush. A command that waits for a stroke's commit runs in the commit frame and costs what
+# it costs at any time (Deselect's full refresh on 24 MP is ~200 ms on llvmpipe): not counted.
+
+[[bench]]
+name = "quick_selection_bench"
+package = "photocraft-ui-egui"
+quick_args = ["--size", "2000x1500", "--frames", "40"]
+note = "24 MP photo-like document, 30 px brush: drag, drag over Select All with Subtract, press and command right after a release, ⌘D mid-drag"
+
+[[scenario]]
+id = "P68"
+title = "Quick Selection drag on 24 MP, 30 px brush (UI-thread frame)"
+issue = 9145
+bench = "quick_selection_bench"
+row = "drag frame"
+metric = "max"
+budget_ms = 16
+enforce = true
+
+[[scenario]]
+id = "P69"
+title = "Quick Selection outline update interval while dragging, 30 px brush on 24 MP"
+issue = 9145
+bench = "quick_selection_bench"
+row = "outline update interval"
+metric = "p50"
+budget_ms = 100
+enforce = false  # 118 ms measured 2026-10-25 (4-core VM): each segment is grown with the stroke's previous segment of travel (a short drag inside an object takes it, as one stroke does), about 110 ms of segmentation on this textured test image
+
+[[scenario]]
+id = "P70"
+title = "Quick Selection Subtract drag over Select All on 24 MP (UI-thread frame)"
+issue = 9145
+bench = "quick_selection_bench"
+row = "drag frame, select all subtract"
+metric = "max"
+budget_ms = 16
+enforce = true
+
+[[scenario]]
+id = "P71"
+title = "Quick Selection: a new stroke pressed right after a release (UI-thread frame)"
+issue = 9145
+bench = "quick_selection_bench"
+row = "press after release"
+metric = "max"
+budget_ms = 16
+enforce = true
+
+[[scenario]]
+id = "P72"
+title = "Quick Selection: a command right after a release (UI-thread call)"
+issue = 9145
+bench = "quick_selection_bench"
+row = "command after release"
+metric = "max"
+budget_ms = 16
+enforce = true
+
+[[scenario]]
+id = "P73"
+title = "Quick Selection: ⌘D during a drag, then the drag and its release (UI-thread frame)"
+issue = 9145
+bench = "quick_selection_bench"
+row = "frames after a mid-drag edit"
+metric = "max"
+budget_ms = 16
+enforce = true

@@ -128,21 +128,40 @@ SOLVER width=256 n=65536 case=all-source old_ms=[1.075863, 1.0908529999999999, 1
 SOLVER width=256 n=65536 case=dense-grid old_ms=[33.334272999999996, 33.502357, 33.531151] new_ms=[4.31308, 4.609208, 4.618033] speedup=7.27
 ```
 
-## Live strokes while dragging (2026-10-24, #9145)
+## Live strokes while dragging (2026-10-25, #9145)
 
-Since #9145 the selection grows while the button is held: each batch of new points is one
-segment of the stroke (`photocraft_engine::quick_stroke`), grown on a worker thread in a rayon
-pool of its own, and the canvas outlines the result. Measured on the 4-vCPU cloud VM (no GPU,
-llvmpipe) with `cargo run --release -p photocraft-ui-egui --example quick_selection_bench`: the
-real app in an offscreen harness, a 6000 × 4000 photo-like RGB document, pointer moves at 60 Hz
-in real time for 2 s along a wave inside an object, view at 50 %. "UI frame" is the app's logic
-for one frame (event handling, outline trace, canvas), without the GPU paint. Before is what the
-release used to cost: the whole stroke as one `select.quick` on the UI thread, with no outline
-while dragging (the same document and stroke).
+Since #9145 the selection grows while the button is held. A stroke is cut by the pointer's travel
+(the press, then about 1.25 brush widths of travel per segment), each segment is grown with the
+stroke's previous segment of travel leading it (so a short drag inside an object takes it, as one
+stroke does), on a worker of its own in a rayon pool apart from the UI's, which also traces the
+new outline; the canvas outlines the result. Measured on the 4-vCPU cloud VM (no GPU, llvmpipe)
+with `cargo run --release -p photocraft-ui-egui --example quick_selection_bench`: the real app in
+an offscreen harness, a 6000 × 4000 photo-like RGB document, pointer moves at 60 Hz in real time
+for 2 s along a wave inside a textured object, view at 50 %. "UI frame" is the app's logic for
+one frame (event handling, outline, canvas), without the GPU paint. Before is what the release
+used to cost: the whole stroke as one `select.quick` on the UI thread, with no outline while
+dragging (the same document and stroke). The bench is registered with `cargo xtask perf`
+(P68–P73 in `perf/budgets.toml`).
 
-| Brush | Outline updates while dragging | Longest UI frame | Committed after release | Before: release stall |
-| --- | --- | --- | --- | --- |
-| 30 px | 14.8 / s (median 67 ms apart) | 5.7 ms | 119 ms | 471 ms (0 updates) |
-| 30 px, 4 s drag | 16.3 / s | 6.0 ms | 119 ms | 1445 ms (0 updates) |
-| 30 px, view at 25 %, 16 px a frame | 14.8 / s | 5.3 ms | 85 ms | 1385 ms (0 updates) |
-| 100 px | 5.4 / s (median 168 ms apart) | 12.8 ms | 170 ms | 543 ms (0 updates) |
+| Scenario (30 px brush) | Outline updates while dragging | Longest UI frame | Committed after release |
+| --- | --- | --- | --- |
+| Drag | 7.9 / s (median 118 ms apart) | 4.7 ms | 337 ms |
+| Select All, then a Subtract drag | 7.9 / s | 4.4 ms | 321 ms |
+| A new stroke pressed the frame after the release | 8.4 / s | 5.9 ms (the press: 5.7 ms) | 374 ms (then the second) |
+| Deselect and Zoom In / Out the frame after the release | 8.4 / s | 5.3 ms (the calls: 0.03 ms) | 346 ms (Deselect then runs) |
+| ⌘D halfway through the drag | 7.8 / s | 3.9 ms | 1144 ms (the stroke regrows on the edited document) |
+| Before: the release | 0 | 455 ms | – |
+
+With a 100 px brush: 2.5 updates a second at this pointer speed (one per 125 px of travel),
+longest UI frame 7.2 ms, committed 0.34–0.88 s after the release (before: 551 ms at the release).
+With 300 px: one a second, the first 0.46 s after the press (the press alone is one 300 px
+segmentation), longest UI frame 5.7 ms (before: 440 ms).
+
+A command that waited for the commit runs in the commit frame and costs what it costs at any
+time: Deselect's full-canvas refresh on 24 MP is about 200 ms with llvmpipe, whether or not a
+stroke came before it.
+
+Each segment takes about 110 ms of segmentation on this textured image (the selection spreads a
+few hundred pixels into the object), so updates come about 8 times a second; growing segments
+from their own points alone took about 67 ms (15 a second), but a fast machine then selected a
+brush band where Photoshop takes the object (review of #9145).
