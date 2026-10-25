@@ -85,6 +85,9 @@ Stop the loop only when LOOP.md says the board is empty.
 
 If the session says `/loop` isn't available, send the same text without `/loop` at the start.
 After any pause, open the session and send `continue`: everything it needs is in the files.
+To end a session cleanly, send `hand off`: it stops its subagents, saves unfinished work under
+`prompts/notes/`, writes where it stopped into the task file and pushes the board (LOOP.md §8).
+A new session started with the same prompt then resumes that task first.
 
 ### B. A routine (a fresh session every few hours, fully hands-off)
 

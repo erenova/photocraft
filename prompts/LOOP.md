@@ -119,6 +119,10 @@ curl -fsS "https://api.github.com/search/issues?q=repo:storytold/photocraft+is:p
 
 Then `git ls-tree -d HEAD prompts | grep -q . && echo "STOP: prompts/ must not be in a fix branch"`.
 
+If the task file has a *Status at handoff* section, follow it: it names the commit to start from,
+any WIP patch under `prompts/notes/NN-slug/` to `git apply`, the review round reached and the next
+steps. Review rounds already spent count toward §5's limit of 3.
+
 ## 4. Implement (one implementer subagent)
 
 Give a `general-purpose` subagent this prompt, filled in. Run one task at a time: the VM has
@@ -217,6 +221,19 @@ on the same branch (the PR updates itself when you push; after a rebase use
 
 If even that finds nothing, write "Board empty, YYYY-MM-DD" at the top of STATUS.md and stop the
 loop.
+
+## 8. Hand off (when the owner asks to stop, or the session must end)
+
+1. Stop every subagent (TaskStop) and the loop's wakeup; check `ps` for leftover cargo runs.
+2. Leave the fix branch at its last good pushed commit. Don't commit unverified work to it: save
+   uncommitted work with `git add -A && git diff --cached --binary HEAD > ../pc-loop/prompts/notes/NN-slug/<name>.patch && git reset -q`,
+   check the patch applies to a clean worktree of that commit, then `git checkout -- . && git clean -fd <its new paths>`.
+3. Copy what dies with the container to `prompts/notes/NN-slug/`: the implementer's `log/devlog.md`
+   entries, reviewers' proof tests and bench scripts, and a `reviews.md` with every round's findings.
+4. Append *Status at handoff* to the task file (where things are, what the patch does, next steps
+   in order), keep `prompts/prs/NN-slug.md` as a marked draft, add learnings.
+5. Set the row to `todo` with "Resume first" in *Notes* (an `in-progress` row would block the next
+   session for 4 hours), add a dated handoff line under the board's title, and push `claude/loop`.
 
 ## Rules that never bend
 

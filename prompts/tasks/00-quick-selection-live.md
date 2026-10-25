@@ -129,3 +129,70 @@ cargo xtask scorecard   # only if a scorecard row or budget moves; commit docs/s
 
 Magic Wand (task 01). Object Selection, Select Subject and the quality of the segmentation
 itself, unless the live path exposes a bug in it.
+
+## Status at handoff (2026-10-25, session stopped by the owner)
+
+**Where things are**
+
+- Branch `claude/fix-00-quick-selection-live` on origin is at **3f25fbb2**: 10 commits on upstream
+  b4a297fe. It is the reviewed round-2 state. The selection grows live off the UI thread, release
+  == last preview == journal replay, New/Add/Subtract and Alt/Shift work, and every gate passes
+  except the pre-existing `layout_bench` panic. It is **not ready for a PR**, because its
+  command-deferral queue has the round-2 blockers (N1 wrong document, N2 authorization bypass).
+- Review history, every finding and the 24 MP numbers: `../notes/00-quick-selection-live/reviews.md`.
+  The round-2 reviewer's proof tests and bench script are in `../notes/00-quick-selection-live/review-2/`.
+- **Round-2 work in progress, uncommitted when stopped:**
+  `../notes/00-quick-selection-live/round-2-wip.patch` (15 files, +1139/−446, binary-safe). It
+  applies cleanly on 3f25fbb2 and reproduces the stopped working tree exactly. The implementer's
+  notes on it are the last entry of `../notes/00-quick-selection-live/devlog.md`. It was kept out
+  of the branch so that the branch stays at a reviewed, green state.
+
+**What the patch does** (from the implementer's notes; unverified by a reviewer)
+
+- **Queue removed.** A released stroke commits as `select.quick` on its own document. While
+  segments still grow, it runs as a background job named "Quick Selection" (`QuickCommit::growing`).
+  The document is locked by the standard `job_conflict`; Esc / `jobs.cancel` cancel it; there are no
+  `{pending}` replies. A press while that job runs chains the next stroke onto the committed result.
+- **`jobs::independent_of_document`:** `view.*` and `gradient.presets.apply` no longer count as
+  document-independent (N4).
+- **Worker moved** to `crates/ui-egui/src/quick_select_ui/worker.rs`. Queued segments' regions grow
+  in parallel and combine in order; regions are cached across a rebase that keeps the pixels (⌘D).
+- **Work caps:** `max_segments(size)` (2^28 px² of windows) and `MAX_POINTS` 250k (m2).
+- **Algo:** a new `quick_select_speculating` that must give the same region as `quick_select`.
+  Verify that the algo tests' pinned results are untouched.
+- **24 MP, 30 px, commit after release** (before → after):
+
+  | Drag | Before | After |
+  |---|---|---|
+  | step 8 | 102–119 ms | 136–220 ms |
+  | step 16 | 1.6–1.8 s | 0.34–0.52 s |
+  | step 32 | 4.9–5.8 s | 2.1–4.3 s |
+  | ⌘D at step 32 | 8.8 s | 2.1–4.7 s |
+
+  Longest UI frame ≤ 8.4 ms. Parallel regions reach only about 1.6× on the VM's 3 worker threads,
+  so the 0.5 s target at step 32 isn't reachable here.
+
+**Next steps, in order**
+
+1. Bootstrap (LOOP.md §0). Then `git switch -C claude/fix-00-quick-selection-live
+   origin/claude/fix-00-quick-selection-live` and `git apply ../pc-loop/prompts/notes/00-quick-selection-live/round-2-wip.patch`.
+2. Build and test the touched crates (`CARGO_INCREMENTAL=0 cargo test -p photocraft-algo -p
+   photocraft-engine -p photocraft-ui-egui --lib --tests`) and fix what fails. The patch's gates
+   were not run when the session stopped.
+3. Finish round 2 against `reviews.md`:
+   - turn `review-2/review_tests.rs` into real tests (N1–N4 must now pass);
+   - N5: decide honestly what the VM can reach; record it and budget it, with `enforce = false` if
+     it misses;
+   - N6: make P69's scenario meaningful;
+   - N7: the wasm warning;
+   - N8: docs dated 2026-10-25;
+   - N9;
+   - investigate one bench run that showed a 1.16 s gap between outline updates at step 16;
+   - update docs (`control-protocol.md` job behaviour, `quick-selection-performance.md`,
+     `ui-parity.md`) and regenerate `docs/scorecard.md`.
+4. Squash into 2–3 commits that are each green (engine; UI; bench, budgets and docs). Rebase onto
+   the newest upstream, run the full gates, and `git push --force-with-lease`.
+5. **Review round 3**, the last allowed by LOOP.md §5: a fresh reviewer, given `reviews.md` for
+   context. If the gates still fail after it, push and mark the row `blocked`.
+6. Ship (LOOP.md §6): update the draft `../prs/00-quick-selection-live.md`, retake the screenshots
+   if the UI changed, and set `ready-for-pr`.

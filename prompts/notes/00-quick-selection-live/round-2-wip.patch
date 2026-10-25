@@ -1,0 +1,2722 @@
+diff --git a/crates/algo/src/segment/quick.rs b/crates/algo/src/segment/quick.rs
+index 8306b6e6..8babfa62 100644
+--- a/crates/algo/src/segment/quick.rs
++++ b/crates/algo/src/segment/quick.rs
+@@ -82,6 +82,17 @@ pub fn quick_select(sampler: &dyn Sampler, canvas: Rect, points: &[(f32, f32)],
+     quick_select_with(sampler, canvas, points, size, &Tuning::default())
+ }
+ 
++/// [`quick_select`] cutting at most `speculate` window sizes at a time (at least one): the same
++/// region whatever `speculate` is. Cutting several at once returns sooner when the stroke needs a
++/// larger window, at the price of cutting larger windows that turn out not to be needed: a caller
++/// growing several strokes in parallel gets more done with `1`.
++pub fn quick_select_speculating(sampler: &dyn Sampler, canvas: Rect, points: &[(f32, f32)], size: f32, speculate: usize) -> Option<Region> {
++    quick_select_batched::<true>(sampler, canvas, points, size, &Tuning::default(), speculate.max(1)).map(|(region, _)| region)
++}
++
++/// How many window sizes [`quick_select`] cuts at a time.
++pub const SPECULATE_DEFAULT: usize = SPECULATE;
++
+ /// [`quick_select`] with explicit model constants.
+ pub fn quick_select_with(sampler: &dyn Sampler, canvas: Rect, points: &[(f32, f32)], size: f32, t: &Tuning) -> Option<Region> {
+     quick_select_using::<true>(sampler, canvas, points, size, t)
+diff --git a/crates/algo/src/segment/tests.rs b/crates/algo/src/segment/tests.rs
+index 135c47b2..f651ecaa 100644
+--- a/crates/algo/src/segment/tests.rs
++++ b/crates/algo/src/segment/tests.rs
+@@ -368,6 +368,12 @@ fn quick_select_cuts_window_sizes_in_parallel_with_the_same_result() {
+         let one = quick::quick_select_batched::<true>(&s, canvas, pts, size, &t, 1);
+         let many = quick::quick_select_batched::<true>(&s, canvas, pts, size, &t, 4);
+         assert_eq!(one.as_ref().map(|(r, n)| (r.bbox, &r.mask, n)), many.as_ref().map(|(r, n)| (r.bbox, &r.mask, n)), "{pts:?} size {size}");
++        // The public entry point, whatever it speculates, is `quick_select`.
++        let plain = quick::quick_select(&s, canvas, pts, size).map(|r| (r.bbox, r.mask));
++        for speculate in [0, 1, 2, 9] {
++            let r = quick::quick_select_speculating(&s, canvas, pts, size, speculate).map(|r| (r.bbox, r.mask));
++            assert_eq!(r, plain, "{pts:?} size {size} speculating {speculate}");
++        }
+         most = most.max(one.map_or(0, |(_, n)| n));
+     }
+     assert!(most > 1, "no stroke needed a larger window, so the test exercises nothing");
+diff --git a/crates/engine/src/jobs.rs b/crates/engine/src/jobs.rs
+index 8d667fd9..fdec28ab 100644
+--- a/crates/engine/src/jobs.rs
++++ b/crates/engine/src/jobs.rs
+@@ -322,11 +322,27 @@ pub enum Started {
+     Job(JobId),
+ }
+ 
+-/// Commands that never edit the active document, allowed while a job runs on it (and run at once
+-/// while a Quick Selection stroke is still being committed).
+-pub fn independent_of_document(id: &str) -> bool {
+-    const PREFIXES: &[&str] = &["jobs.", "tools.", "view.", "window.", "help.", "brush.presets.", "gradient.presets."];
+-    const IDS: &[&str] = &["file.new", "file.close", "file.closeAll", "edit.preferences", "edit.colorSettings", "edit.keyboardShortcuts", "edit.menus"];
++/// Journaled commands that never edit a document, allowed while a job runs on the active one
++/// (queries and view state, which aren't journaled, always are). Every other journaled command may
++/// make a history step on it, so it waits: guides, slices and the ruler origin (`view.newGuide`…)
++/// and a gradient preset applied as a fill layer (`gradient.presets.apply`) are document edits.
++fn independent_of_document(id: &str) -> bool {
++    const PREFIXES: &[&str] = &["jobs.", "tools.", "window.", "help.", "brush.presets."];
++    const IDS: &[&str] = &[
++        "file.new",
++        "file.close",
++        "file.closeAll",
++        "edit.preferences",
++        "edit.colorSettings",
++        "edit.keyboardShortcuts",
++        "edit.menus",
++        "gradient.presets.edit",
++        "gradient.presets.importGrd",
++        "gradient.presets.new",
++        "gradient.presets.reset",
++        "gradient.presets.select",
++        "gradient.presets.stop",
++    ];
+     PREFIXES.iter().any(|p| id.starts_with(p)) || IDS.contains(&id)
+ }
+ 
+diff --git a/crates/engine/src/jobs_tests.rs b/crates/engine/src/jobs_tests.rs
+index 8ae8d904..21db3485 100644
+--- a/crates/engine/src/jobs_tests.rs
++++ b/crates/engine/src/jobs_tests.rs
+@@ -283,6 +283,33 @@ fn a_running_job_locks_its_document_but_not_others() {
+     assert_eq!(s.documents()[0].history.past_len(), 3);
+ }
+ 
++#[test]
++fn a_running_job_refuses_every_command_that_makes_a_history_step_on_its_document() {
++    // Guides, slices, the ruler origin and a gradient preset applied as a fill layer are steps in
++    // the document's history: run under a job, they would land before its result and ⌘Z would
++    // take back the job instead of them (#9145).
++    let mut s = session(64, 64);
++    let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
++    let id = gated_job(&mut s, &gate);
++    let steps = s.active().unwrap().history.past_len();
++    for (cmd, p) in [
++        ("view.newGuide", json!({"orientation": "vertical", "position": 40})),
++        ("view.clearGuides", json!({})),
++        ("view.setRulerOrigin", json!({"x": 4, "y": 4})),
++        ("gradient.presets.apply", json!({"angle": 0})),
++    ] {
++        let err = s.execute(cmd, p).unwrap_err();
++        assert!(matches!(&err, EngineError::Disabled(_, why) if why.contains("Gated Job")), "{cmd}: {err}");
++    }
++    assert_eq!(s.active().unwrap().history.past_len(), steps, "nothing ran");
++    // Brush, colours and presets aren't the document's: they still change.
++    s.execute("tools.setBrush", json!({"size": 12})).unwrap();
++    s.execute("tools.swapColors", json!({})).unwrap();
++    gate.store(true, std::sync::atomic::Ordering::Relaxed);
++    assert!(matches!(wait_event(&mut s, id).outcome, JobOutcome::Done(_)));
++    s.execute("view.newGuide", json!({"orientation": "vertical", "position": 40})).unwrap();
++}
++
+ #[test]
+ fn jobs_list_puts_running_jobs_before_ended_ones() {
+     let mut s = session(64, 64);
+diff --git a/crates/engine/src/quick_stroke.rs b/crates/engine/src/quick_stroke.rs
+index bc703882..5e55e35a 100644
+--- a/crates/engine/src/quick_stroke.rs
++++ b/crates/engine/src/quick_stroke.rs
+@@ -12,12 +12,19 @@
+ //! an object too big for a click selects the object (measured in Photoshop,
+ //! `quick_select_a_short_drag_takes_what_a_click_does_not`), as it does in one segment.
+ //!
++//! A segment's region depends only on the document's pixels and its polyline
++//! ([`QuickStroke::plan`]), never on the selection, so the regions of several segments can grow at
++//! once, on as many threads as there are; only combining them ([`QuickStroke::apply`]) runs in
++//! order, so the result is the same however they were grown.
++//!
+ //! A live stroke is cut by the pointer's travel alone ([`Cutter`]), never by how long a segment
+ //! takes to grow, so the same motion gives the same selection on any machine. `select.quick`
+ //! records the cut (`segments`) and computes exactly these segments in this order, so the
+ //! selection shown while dragging ([`QuickStroke`], driven by the shell off the UI thread), the
+ //! one committed on release and the one a replay of the journal makes are the same. Without
+-//! `segments` the whole stroke is one segment, as before.
++//! `segments` the whole stroke is one segment, as before. A stroke offered while some of its
++//! segments still grow ([`QuickCommit::growing`]) is committed as a background job on its document
++//! that waits for them: until it is applied, that document is locked like for any job.
+ //!
+ //! Modes: a segment adds, subtracts or replaces. A stroke replaces the old selection only with
+ //! its first segment that finds anything; every later `replace` segment adds (a New Selection
+@@ -27,19 +34,45 @@
+ 
+ use std::sync::Arc;
+ 
++use photocraft_algo::segment::quick::SPECULATE_DEFAULT;
+ use photocraft_algo::selection::{Region, SelectionMode, combine_region};
+ use photocraft_doc::{DocId, Document, LayerId};
+ use photocraft_geom::Rect;
+ use photocraft_raster::Surface;
+ use serde_json::{Value, json};
+ 
+-use crate::{EngineError, Result, Session};
++use crate::jobs::JobCtx;
++use crate::{DocState, EngineError, Result, Session};
+ 
+ /// Most segments one stroke may be cut into: a live drag adds one per [`segment_travel`] of the
+ /// pointer, so this is a drag of over 100,000 px with a small brush. Every segment is a
+-/// segmentation, so a replayed or scripted stroke can't ask for an unbounded number.
++/// segmentation, so a replayed or scripted stroke can't ask for an unbounded number; a larger
++/// brush allows fewer ([`max_segments`]).
+ pub const MAX_SEGMENTS: usize = 4096;
+ 
++/// Most points one stroke may have (a live drag adds one per pointer move).
++pub const MAX_POINTS: usize = 250_000;
++
++/// Most work one stroke may ask for, in document px² of segmentation windows: segments times
++/// [`segment_work`]. Generous for anything painted (a 300 px brush gets over 300 segments, some
++/// 120,000 px of travel), it keeps a scripted stroke from running for an hour.
++const MAX_WORK: f64 = (1u64 << 28) as f64;
++
++/// The least a segment's segmentation covers (document px²): the brush and the window around it,
++/// which reaches at least `max(96, size)` px past it on every side.
++fn segment_work(size: f32) -> f64 {
++    let s = f64::from(clamp_size(size));
++    let side = s + 2.0 * s.max(96.0);
++    side * side
++}
++
++/// Most segments a stroke with brush diameter `size` may have: [`MAX_SEGMENTS`], fewer for a
++/// brush so large that so many would take too long, and always at least one.
++pub fn max_segments(size: f32) -> usize {
++    let n = (MAX_WORK / segment_work(size)).floor();
++    if n >= MAX_SEGMENTS as f64 { MAX_SEGMENTS } else { (n as usize).max(1) }
++}
++
+ /// The shortest travel (document px) that ends a live segment, whatever the brush.
+ pub const MIN_TRAVEL: f32 = 24.0;
+ 
+@@ -63,10 +96,12 @@ pub fn segment_overlap(size: f32) -> f32 {
+ /// press is a segment of its own (a click selects at once), then a segment ends at the first
+ /// point where the pointer has travelled [`segment_travel`] since it began, or before a point
+ /// painted in another mode (a modifier pressed or let go). The same motion gives the same cut on
+-/// any machine; the cut is capped at [`MAX_SEGMENTS`], the rest being the last segment.
++/// any machine; the cut is capped at [`max_segments`], the rest being the last segment.
+ #[derive(Clone, Debug)]
+ pub struct Cutter {
+     travel: f32,
++    /// Most segments ([`max_segments`]).
++    cap: usize,
+     points: usize,
+     /// Where the open segment starts, and its mode.
+     open: usize,
+@@ -80,11 +115,11 @@ pub struct Cutter {
+ impl Cutter {
+     /// A cutter for a stroke with brush diameter `size`.
+     pub fn new(size: f32) -> Self {
+-        Self { travel: segment_travel(size), points: 0, open: 0, open_mode: None, moved: 0.0, last: None, closed: Vec::new() }
++        Self { travel: segment_travel(size), cap: max_segments(size), points: 0, open: 0, open_mode: None, moved: 0.0, last: None, closed: Vec::new() }
+     }
+ 
+     fn at_cap(&self) -> bool {
+-        self.closed.len() + 1 >= MAX_SEGMENTS
++        self.closed.len() + 1 >= self.cap
+     }
+ 
+     fn close(&mut self) {
+@@ -134,6 +169,11 @@ impl Cutter {
+ /// The brush diameter range `select.quick` works with (px).
+ const SIZE: std::ops::RangeInclusive<f32> = 1.0..=5000.0;
+ 
++/// A brush diameter as `select.quick` uses it: within [`SIZE`], 30 px when not a number.
++fn clamp_size(size: f32) -> f32 {
++    if size.is_nan() { 30.0 } else { size.clamp(*SIZE.start(), *SIZE.end()) }
++}
++
+ fn bad(msg: impl Into<String>) -> EngineError {
+     EngineError::BadParams { cmd: "select.quick".into(), msg: msg.into() }
+ }
+@@ -215,7 +255,6 @@ pub fn segments(p: &Value, n: usize) -> Result<Vec<(usize, SelectionMode)>> {
+ #[derive(Clone)]
+ pub struct QuickSource {
+     doc: Arc<Document>,
+-    base: (DocId, u64),
+     layer: Option<LayerId>,
+     all_layers: bool,
+     size: f32,
+@@ -225,17 +264,23 @@ pub struct QuickSource {
+ impl QuickSource {
+     /// The source `select.quick` with params `p` reads on the active document now.
+     pub fn new(s: &Session, p: &Value) -> Result<Self> {
+-        let st = s.active().ok_or(EngineError::NoDocument)?;
++        Ok(Self::of(s.active().ok_or(EngineError::NoDocument)?, p))
++    }
++
++    /// The source `select.quick` with params `p` reads on document `doc` now, active or not.
++    pub fn on(s: &Session, doc: DocId, p: &Value) -> Result<Self> {
++        Ok(Self::of(s.documents().iter().find(|st| st.doc.id == doc).ok_or(EngineError::NoDocument)?, p))
++    }
++
++    fn of(st: &DocState, p: &Value) -> Self {
+         let size = p.get("size").and_then(Value::as_f64).map_or(30.0, |v| v as f32);
+-        let size = if size.is_nan() { 30.0 } else { size.clamp(*SIZE.start(), *SIZE.end()) };
+-        Ok(Self {
++        Self {
+             doc: Arc::clone(&st.doc),
+-            base: (st.doc.id, st.revision),
+             layer: st.active_layer,
+             all_layers: p.get("sampleAllLayers").and_then(Value::as_bool).unwrap_or(false),
+-            size,
++            size: clamp_size(size),
+             enhance: p.get("enhanceEdge").and_then(Value::as_bool).unwrap_or(false),
+-        })
++        }
+     }
+ 
+     /// The selection when the stroke began.
+@@ -243,9 +288,15 @@ impl QuickSource {
+         self.doc.selection.as_ref()
+     }
+ 
+-    /// The document and revision the stroke began on.
+-    pub fn base(&self) -> (DocId, u64) {
+-        self.base
++    /// The document the stroke is on.
++    pub fn doc(&self) -> DocId {
++        self.doc.id
++    }
++
++    /// Whether `st` is still the document this source read (any edit makes a new one; view state
++    /// such as Color Samplers doesn't).
++    pub fn reads(&self, st: &DocState) -> bool {
++        Arc::ptr_eq(&self.doc, &st.doc)
+     }
+ 
+     /// The brush diameter, as clamped for the selection (px).
+@@ -253,19 +304,68 @@ impl QuickSource {
+         self.size
+     }
+ 
+-    /// Same pixels, layer and settings (not compared: the document snapshot itself).
++    fn same_settings(&self, o: &Self) -> bool {
++        self.doc.id == o.doc.id
++            && self.layer == o.layer
++            && self.all_layers == o.all_layers
++            && self.size.to_bits() == o.size.to_bits()
++            && self.enhance == o.enhance
++    }
++
++    /// The same document snapshot, layer and settings.
+     fn same(&self, o: &Self) -> bool {
+-        self.base == o.base && self.layer == o.layer && self.all_layers == o.all_layers && self.size.to_bits() == o.size.to_bits() && self.enhance == o.enhance
++        self.same_settings(o) && Arc::ptr_eq(&self.doc, &o.doc)
++    }
++
++    /// Whether every segment grows to the same region on `o` as on this source: same settings and
++    /// the same pixels to sample (the document changed in some other way, such as its selection,
++    /// or not at all).
++    pub fn same_pixels(&self, o: &Self) -> bool {
++        if !self.same_settings(o) {
++            return false;
++        }
++        if Arc::ptr_eq(&self.doc, &o.doc) {
++            return true;
++        }
++        // The sampled layer's pixels, shared tile for tile (an edit elsewhere keeps them).
++        match (self.all_layers, self.sampled_surface(), o.sampled_surface()) {
++            (false, Some(a), Some(b)) => {
++                self.doc.bounds() == o.doc.bounds()
++                    && a.format() == b.format()
++                    && a.tiles().count() == b.tiles().count()
++                    && a.tiles().zip(b.tiles()).all(|((ca, ta), (cb, tb))| ca == cb && Arc::ptr_eq(ta, tb))
++            }
++            _ => false,
++        }
++    }
++
++    /// The layer pixels a stroke samples, unless it samples the composite.
++    fn sampled_surface(&self) -> Option<&Surface> {
++        self.layer.and_then(|id| self.doc.layer(id)).and_then(photocraft_doc::Layer::surface)
+     }
+ 
+     /// The region a segment (`pts`, a polyline) grows to, or `None` when it misses the canvas.
+     pub fn region(&self, pts: &[(f32, f32)]) -> Option<Region> {
+-        crate::smartselect_cmds::quick_region(&self.doc, self.layer, self.all_layers, pts, self.size, self.enhance)
++        self.region_speculating(pts, SPECULATE_DEFAULT)
++    }
++
++    /// [`QuickSource::region`] cutting at most `speculate` window sizes at a time: the same region,
++    /// with less wasted work (and later) when several segments grow at once.
++    pub fn region_speculating(&self, pts: &[(f32, f32)], speculate: usize) -> Option<Region> {
++        crate::smartselect_cmds::quick_region(&self.doc, self.layer, self.all_layers, pts, self.size, self.enhance, speculate)
+     }
+ }
+ 
+-/// A stroke selected segment by segment: the selection after every segment pushed so far.
+-/// Pushing a segment is the heavy part (it runs the segmentation); everything else is cheap.
++/// A segment of a stroke, ready to grow ([`QuickStroke::plan`]): the polyline its region grows
++/// from (its lead, then its points) and how it combines.
++#[derive(Clone, Debug)]
++pub struct Planned {
++    pub line: Vec<(f32, f32)>,
++    pub mode: SelectionMode,
++}
++
++/// A stroke selected segment by segment: the selection after every segment combined so far.
++/// Growing a segment's region is the heavy part (a segmentation); everything else is cheap.
+ #[derive(Clone, Debug)]
+ pub struct QuickStroke {
+     selection: Option<Surface>,
+@@ -282,6 +382,8 @@ pub struct QuickStroke {
+     bounds: Rect,
+     points: Vec<(f32, f32)>,
+     segments: Vec<(usize, SelectionMode)>,
++    /// Segments combined so far (the others are planned, their regions still growing).
++    combined: usize,
+ }
+ 
+ impl QuickStroke {
+@@ -296,14 +398,17 @@ impl QuickStroke {
+             bounds: Rect::EMPTY,
+             points: Vec::new(),
+             segments: Vec::new(),
++            combined: 0,
+         }
+     }
+ 
+-    /// Select the next segment, `pts` (non-finite points are skipped), in `mode`. Returns the
+-    /// region the segment changed (empty when it found nothing).
+-    pub fn push(&mut self, src: &QuickSource, pts: &[(f32, f32)], mode: SelectionMode) -> Rect {
++    /// Record the next segment, `pts` (non-finite points are skipped), in `mode`, and return what
++    /// its region grows from; `None` (and nothing recorded) when it has no point. Its region
++    /// ([`QuickSource::region`]) depends on nothing else, so the regions of segments planned one
++    /// after another can grow at once; they must then be [applied](QuickStroke::apply) in order.
++    pub fn plan(&mut self, src: &QuickSource, pts: &[(f32, f32)], mode: SelectionMode) -> Option<Planned> {
+         let pts: Vec<(f32, f32)> = pts.iter().copied().filter(|(x, y)| x.is_finite() && y.is_finite()).collect();
+-        let Some(&end) = pts.last() else { return Rect::EMPTY };
++        let &end = pts.last()?;
+         // The stroke's run of this kind, so far: a change between selecting and subtracting starts
+         // a new one at the previous segment's last point.
+         let subtracts = mode == SelectionMode::Subtract;
+@@ -319,7 +424,14 @@ impl QuickStroke {
+         self.last = Some(end);
+         self.points.extend_from_slice(&pts);
+         self.segments.push((pts.len(), mode));
+-        let Some(region) = src.region(&line) else { return Rect::EMPTY };
++        Some(Planned { line, mode })
++    }
++
++    /// Combine the region the next planned segment grew to (`None`: it found nothing) into the
++    /// selection; returns the area it changed (empty when it found nothing).
++    pub fn apply(&mut self, mode: SelectionMode, region: Option<Region>) -> Rect {
++        self.combined += 1;
++        let Some(region) = region else { return Rect::EMPTY };
+         // Only the stroke's first segment that finds anything replaces: a later one adds, so it
+         // never wipes what the stroke did before it (a subtraction with ⌥ held, say).
+         let m = if mode == SelectionMode::Replace && self.applied { SelectionMode::Add } else { mode };
+@@ -330,7 +442,15 @@ impl QuickStroke {
+         region.bbox
+     }
+ 
+-    /// The selection after the segments so far.
++    /// Select the next segment, `pts`, in `mode` now: [`plan`](QuickStroke::plan), grow, and
++    /// [`apply`](QuickStroke::apply). Returns the region the segment changed.
++    pub fn push(&mut self, src: &QuickSource, pts: &[(f32, f32)], mode: SelectionMode) -> Rect {
++        let Some(planned) = self.plan(src, pts, mode) else { return Rect::EMPTY };
++        let region = src.region(&planned.line);
++        self.apply(planned.mode, region)
++    }
++
++    /// The selection after the segments combined so far.
+     pub fn selection(&self) -> Option<&Surface> {
+         self.selection.as_ref()
+     }
+@@ -341,26 +461,36 @@ impl QuickStroke {
+         self.changed
+     }
+ 
+-    /// The points of the segments so far, as they were selected.
++    /// The points of the segments planned so far, as they were selected.
+     pub fn points(&self) -> &[(f32, f32)] {
+         &self.points
+     }
+ 
+-    /// The segments so far: point count and mode.
++    /// The segments planned so far: point count and mode.
+     pub fn segments(&self) -> &[(usize, SelectionMode)] {
+         &self.segments
+     }
+ 
++    /// How many of them have been combined into the selection.
++    pub fn combined(&self) -> usize {
++        self.combined
++    }
++
+     /// `select.quick`'s `points` and `segments` for the stroke so far (the counts alone where a
+     /// segment's mode is the stroke's).
+     pub fn params(&self) -> Value {
+-        let mode = self.segments.first().map_or(SelectionMode::Add, |s| s.1);
+-        let segments: Vec<Value> = self.segments.iter().map(|&(n, m)| if m == mode { json!(n) } else { json!({"points": n, "mode": mode_name(m)}) }).collect();
+-        let points: Vec<[f64; 2]> = self.points.iter().map(|&(x, y)| [f64::from(x), f64::from(y)]).collect();
+-        json!({"points": points, "segments": segments, "mode": mode_name(mode)})
++        params_of(&self.points, &self.segments)
+     }
+ }
+ 
++/// `select.quick`'s `points`, `segments` and `mode` for a stroke of `points` cut as `segments`.
++pub fn params_of(points: &[(f32, f32)], segments: &[(usize, SelectionMode)]) -> Value {
++    let mode = segments.first().map_or(SelectionMode::Add, |s| s.1);
++    let segments: Vec<Value> = segments.iter().map(|&(n, m)| if m == mode { json!(n) } else { json!({"points": n, "mode": mode_name(m)}) }).collect();
++    let points: Vec<[f64; 2]> = points.iter().map(|&(x, y)| [f64::from(x), f64::from(y)]).collect();
++    json!({"points": points, "segments": segments, "mode": mode_name(mode)})
++}
++
+ /// Where the last `travel` (document px) of the polyline `run` starts: the index of its first point.
+ fn lead_start(run: &[(f32, f32)], travel: f32) -> usize {
+     let mut back = 0.0f32;
+@@ -375,25 +505,94 @@ fn lead_start(run: &[(f32, f32)], travel: f32) -> usize {
+     i
+ }
+ 
++/// Threads regions can grow on at once here.
++fn threads() -> usize {
++    #[cfg(not(target_arch = "wasm32"))]
++    return rayon::current_num_threads().max(1);
++    #[cfg(target_arch = "wasm32")]
++    return 1;
++}
++
++/// Grow the regions of `planned` segments (in parallel where there are threads; `None` entries
++/// found nothing to grow) for [`QuickStroke::apply`], in order.
++pub fn grow_regions(src: &QuickSource, planned: &[Option<Planned>]) -> Vec<Option<Region>> {
++    // Several at once: each cuts one window size at a time, so no thread cuts windows that turn
++    // out not to be needed while another segment waits.
++    let speculate = if planned.len() > 1 { 1 } else { SPECULATE_DEFAULT };
++    let grow = |p: &Option<Planned>| p.as_ref().and_then(|p| src.region_speculating(&p.line, speculate));
++    #[cfg(not(target_arch = "wasm32"))]
++    {
++        use rayon::prelude::*;
++        planned.par_iter().map(grow).collect()
++    }
++    #[cfg(target_arch = "wasm32")]
++    planned.iter().map(grow).collect()
++}
++
++/// Grow the stroke of `pts` cut as `segments` onto `stroke`: as many segments' regions at a time
++/// as there are threads, combined in order, checking `ctx` (cancellation, progress) between them.
++pub fn grow_segments(src: &QuickSource, stroke: &mut QuickStroke, pts: &[(f32, f32)], segments: &[(usize, SelectionMode)], ctx: &JobCtx) -> Result<()> {
++    let mut planned = Vec::with_capacity(segments.len());
++    let mut at = 0usize;
++    for &(n, m) in segments {
++        let end = at.saturating_add(n).min(pts.len());
++        planned.push(stroke.plan(src, pts.get(at..end).unwrap_or_default(), m));
++        at = end;
++    }
++    let total = planned.len().max(1) as f32;
++    let mut done = 0usize;
++    for group in planned.chunks(threads()) {
++        ctx.check()?;
++        ctx.progress(done as f32 / total, "Selecting");
++        for (p, region) in group.iter().zip(grow_regions(src, group)) {
++            let mode = p.as_ref().map_or(SelectionMode::Add, |p| p.mode);
++            if p.is_some() {
++                stroke.apply(mode, region);
++            }
++        }
++        done += group.len();
++    }
++    Ok(())
++}
++
++/// How `select.quick` gets the rest of an offered stroke whose last segments are still growing:
++/// whoever grows them hands back the stroke once all have been combined. It runs as the command's
++/// background work (so it may wait), and stops with `Err(Cancelled)` when `ctx` is cancelled.
++pub type Finish = Box<dyn FnOnce(&JobCtx) -> Result<QuickStroke> + Send>;
++
++/// An offered stroke: grown in full, or still growing.
++enum Offered {
++    Grown(QuickStroke),
++    Growing(Finish),
++}
++
+ /// A stroke selected live, offered to the `select.quick` that commits it
+ /// ([`Session::offer_live_quick`]): when that command's document, settings, points and segments
+ /// are exactly the stroke's, it takes its selection instead of growing every segment again.
+ pub struct QuickCommit {
+     src: QuickSource,
+-    stroke: QuickStroke,
++    points: Vec<(f32, f32)>,
++    segments: Vec<(usize, SelectionMode)>,
++    stroke: Offered,
+ }
+ 
+ impl QuickCommit {
++    /// A stroke whose segments have all been combined.
+     pub fn new(src: QuickSource, stroke: QuickStroke) -> Self {
+-        Self { src, stroke }
++        Self { src, points: stroke.points.clone(), segments: stroke.segments.clone(), stroke: Offered::Grown(stroke) }
++    }
++
++    /// A stroke of `points` cut as `segments` whose last segments are still growing: `finish`
++    /// hands it back once they have, and the command commits it as a background job.
++    pub fn growing(src: QuickSource, points: Vec<(f32, f32)>, segments: Vec<(usize, SelectionMode)>, finish: Finish) -> Self {
++        Self { src, points, segments, stroke: Offered::Growing(finish) }
+     }
+ 
+     /// The stroke, if `select.quick` with these inputs would compute exactly it.
+-    pub(crate) fn take_if(self, src: &QuickSource, pts: &[(f32, f32)], segments: &[(usize, SelectionMode)]) -> Option<QuickStroke> {
+-        // The selection the stroke started from is the document's at that revision.
+-        let same_points = self.stroke.points.len() == pts.len()
+-            && self.stroke.points.iter().zip(pts).all(|(a, b)| a.0.to_bits() == b.0.to_bits() && a.1.to_bits() == b.1.to_bits());
+-        (self.src.same(src) && same_points && self.stroke.segments == segments).then_some(self.stroke)
++    fn take_if(self, src: &QuickSource, pts: &[(f32, f32)], segments: &[(usize, SelectionMode)]) -> Option<Offered> {
++        let same_points =
++            self.points.len() == pts.len() && self.points.iter().zip(pts).all(|(a, b)| a.0.to_bits() == b.0.to_bits() && a.1.to_bits() == b.1.to_bits());
++        (self.src.same(src) && same_points && self.segments == segments).then_some(self.stroke)
+     }
+ }
+ 
+@@ -414,10 +613,34 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
+     if pts.is_empty() {
+         return Err(bad("needs at least one point"));
+     }
++    if pts.len() > MAX_POINTS {
++        return Err(bad(format!("a stroke can have at most {MAX_POINTS} points (got {})", pts.len())));
++    }
+     let segments = segments(p, pts.len())?;
+     let src = QuickSource::new(s, p)?;
+-    if let Some(stroke) = offered.and_then(|c| c.take_if(&src, &pts, &segments)) {
+-        return commit(s, stroke, true);
++    let most = max_segments(src.size());
++    if segments.len() > most {
++        return Err(bad(format!("a stroke of a {} px brush can have at most {most} segments (got {}): it would take too long", src.size(), segments.len())));
++    }
++    match offered.and_then(|c| c.take_if(&src, &pts, &segments)) {
++        Some(Offered::Grown(stroke)) => return commit(s, stroke, true),
++        // The live stroke's last segments are still growing: a background job (inline where the
++        // shell runs none) waits for them, and the document is locked until it is applied.
++        Some(Offered::Growing(finish)) => {
++            return crate::jobs::run(
++                s,
++                "Quick Selection",
++                true,
++                move |ctx| {
++                    let stroke = finish(ctx)?;
++                    // Exactly the stroke asked for, every segment combined.
++                    let whole = stroke.segments == segments && stroke.combined == segments.len() && stroke.points.len() == pts.len();
++                    if whole { Ok(stroke) } else { Err(EngineError::Other("internal error: the live Quick Selection stroke came back incomplete".into())) }
++                },
++                move |s, stroke| commit(s, stroke, true),
++            );
++        }
++        None => {}
+     }
+     // Grown here: a background job where the shell runs those (a scripted or replayed stroke of
+     // many segments shows progress and can be cancelled between segments).
+@@ -427,16 +650,8 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
+         "Quick Selection",
+         true,
+         move |ctx| {
+-            let total = segments.len().max(1) as f32;
+             let mut stroke = QuickStroke::new(base);
+-            let mut at = 0usize;
+-            for (k, &(n, m)) in segments.iter().enumerate() {
+-                ctx.check()?;
+-                ctx.progress(k as f32 / total, "Selecting");
+-                let end = at.saturating_add(n).min(pts.len());
+-                stroke.push(&src, pts.get(at..end).unwrap_or_default(), m);
+-                at = end;
+-            }
++            grow_segments(&src, &mut stroke, &pts, &segments, ctx)?;
+             Ok(stroke)
+         },
+         move |s, stroke| commit(s, stroke, false),
+diff --git a/crates/engine/src/quick_stroke/tests.rs b/crates/engine/src/quick_stroke/tests.rs
+index 50434d3b..4c187da3 100644
+--- a/crates/engine/src/quick_stroke/tests.rs
++++ b/crates/engine/src/quick_stroke/tests.rs
+@@ -422,3 +422,158 @@ fn a_replayed_stroke_is_capped_and_can_be_cancelled() {
+     s.set_inline_job_ctx(None);
+     assert!(s.execute("select.quick", json!({"points": [[20, 50], [30, 50]], "segments": [1, 1]})).is_ok());
+ }
++
++/// A stroke cut as a drag delivers it, with ⌥ pressed and let go (subtract, then replace again).
++const CUT: [(&[(f32, f32)], SelectionMode); 5] = [
++    (&[(20.0, 50.0)], SelectionMode::Replace),
++    (&[(24.0, 50.0), (30.0, 52.0)], SelectionMode::Replace),
++    (&[(40.0, 60.0), (52.0, 58.0)], SelectionMode::Replace),
++    (&[(110.0, 30.0)], SelectionMode::Subtract),
++    (&[(112.0, 40.0), (115.0, 45.0)], SelectionMode::Replace),
++];
++
++#[test]
++fn regions_grown_at_once_combine_to_what_one_at_a_time_makes() {
++    for depth in [8, 16, 32] {
++        let mut s = two_regions(depth);
++        s.execute("select.rect", json!({"x": 100, "y": 70, "width": 20, "height": 20})).unwrap();
++        let src = QuickSource::new(&s, &json!({"size": 8})).unwrap();
++        let mut one = QuickStroke::new(src.selection().cloned());
++        for (pts, m) in CUT {
++            one.push(&src, pts, m);
++        }
++        // Planned in order, grown together (in any order, on any thread), combined in order.
++        let mut many = QuickStroke::new(src.selection().cloned());
++        let planned: Vec<Option<Planned>> = CUT.iter().map(|(pts, m)| many.plan(&src, pts, *m)).collect();
++        assert_eq!(many.combined(), 0);
++        for (p, region) in planned.iter().zip(grow_regions(&src, &planned)) {
++            many.apply(p.as_ref().unwrap().mode, region);
++        }
++        assert_eq!(many.combined(), CUT.len());
++        assert_eq!(surface_bytes(many.selection(), 140, 100), surface_bytes(one.selection(), 140, 100), "depth {depth}");
++        assert_eq!(many.params(), one.params());
++        assert!(many.changed() && many.selection().is_some());
++    }
++}
++
++/// A growing offer for `s`'s stroke `CUT`: its first segment grown, the others planned; `finish`
++/// grows them once `gate` opens, unless cancelled first. Returns the offer and `select.quick`'s
++/// params for it.
++fn growing_offer(s: &Session, gate: &Arc<std::sync::atomic::AtomicBool>) -> (QuickCommit, Value) {
++    let src = QuickSource::new(s, &json!({"size": 8})).unwrap();
++    let mut live = QuickStroke::new(src.selection().cloned());
++    live.push(&src, CUT[0].0, CUT[0].1);
++    let planned: Vec<Planned> = CUT[1..].iter().filter_map(|(pts, m)| live.plan(&src, pts, *m)).collect();
++    let mut params = live.params();
++    params["size"] = json!(8);
++    let (points, segments) = (live.points().to_vec(), live.segments().to_vec());
++    let (gate, grows) = (gate.clone(), src.clone());
++    let finish: Finish = Box::new(move |ctx: &crate::jobs::JobCtx| {
++        while !gate.load(std::sync::atomic::Ordering::Relaxed) {
++            ctx.check()?;
++            std::thread::sleep(std::time::Duration::from_millis(1));
++        }
++        for p in planned {
++            let region = grows.region(&p.line);
++            live.apply(p.mode, region);
++        }
++        Ok(live)
++    });
++    (QuickCommit::growing(src, points, segments, finish), params)
++}
++
++#[test]
++fn a_stroke_still_growing_commits_as_a_job_on_its_own_document() {
++    for depth in [8, 16, 32] {
++        let mut s = two_regions(depth);
++        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let (offer, params) = growing_offer(&s, &gate);
++        s.offer_live_quick(offer);
++        let crate::jobs::Started::Job(job) = s.start("select.quick", params.clone()).unwrap() else { panic!("depth {depth}: a job") };
++        // Its document is locked like for any job: an edit is refused with the job's name.
++        let err = s.execute("select.all", json!({})).unwrap_err();
++        assert!(err.to_string().contains("Quick Selection") && err.to_string().contains("still running"), "{err}");
++        // Another document becomes the active one meanwhile: the stroke still lands on its own.
++        s.execute("file.new", json!({"width": 16, "height": 16})).unwrap();
++        gate.store(true, std::sync::atomic::Ordering::Relaxed);
++        let r = s.wait_job(job).unwrap();
++        assert_eq!(r["fromLive"], true, "depth {depth}: {r}");
++        assert_eq!(s.active_index(), Some(1), "the active document stays the new one");
++        assert!(s.documents()[1].doc.selection.is_none());
++        s.set_active(0);
++        let (id, journaled) = s.journal.iter().rev().find(|(id, _)| id == "select.quick").unwrap().clone();
++        assert_eq!(id, "select.quick");
++        assert_eq!(sel_bytes(&s), replayed(depth, &[], &journaled), "depth {depth}: commit == replay");
++        assert_eq!(s.active().unwrap().history.undo_label(), Some("Quick Selection"));
++    }
++}
++
++#[test]
++fn a_growing_stroke_cancelled_leaves_the_document_alone() {
++    let mut s = two_regions(8);
++    let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
++    let (offer, params) = growing_offer(&s, &gate);
++    let steps = s.active().unwrap().history.past_len();
++    s.offer_live_quick(offer);
++    let crate::jobs::Started::Job(job) = s.start("select.quick", params).unwrap() else { panic!("a job") };
++    assert!(s.cancel_job(job));
++    s.join_cancelled_jobs();
++    let _ = s.poll_jobs();
++    assert!(s.active().unwrap().doc.selection.is_none());
++    assert_eq!(s.active().unwrap().history.past_len(), steps);
++    assert!(s.execute("select.all", json!({})).is_ok(), "unlocked");
++}
++
++#[test]
++fn a_stroke_too_costly_for_its_brush_is_refused_before_any_work() {
++    assert_eq!(max_segments(30.0), MAX_SEGMENTS);
++    assert_eq!(max_segments(f32::NAN), MAX_SEGMENTS);
++    let at_300 = max_segments(300.0);
++    assert!((300..=400).contains(&at_300), "{at_300}");
++    assert_eq!(max_segments(5000.0), 1);
++    assert_eq!(max_segments(1e9), 1);
++    assert_eq!(max_segments(-4.0), MAX_SEGMENTS);
++    // A live cut stops at the cap: the rest is the last segment.
++    let mut c = Cutter::new(5000.0);
++    for i in 0..100 {
++        c.push((i as f32 * 900.0, 0.0), SelectionMode::Add);
++    }
++    c.finish();
++    assert_eq!(c.closed(), &[(100, SelectionMode::Add)]);
++    // A scripted stroke over the cap is refused at once, with the reason.
++    let mut s = two_regions(8);
++    let cap = max_segments(3000.0);
++    let stroke = |n: usize| {
++        let pts: Vec<[f64; 2]> = (0..n).map(|i| [(i * 20 % 140) as f64, 50.0]).collect();
++        json!({"points": pts, "segments": vec![1; n], "size": 3000})
++    };
++    let t = std::time::Instant::now();
++    let err = s.execute("select.quick", stroke(cap + 1)).unwrap_err();
++    assert!(matches!(&err, EngineError::BadParams { msg, .. } if msg.contains("at most")), "{err}");
++    assert!(t.elapsed() < std::time::Duration::from_secs(2), "refused before growing anything");
++    assert!(s.execute("select.quick", stroke(cap)).is_ok());
++    let err = s.execute("select.quick", json!({"points": vec![[10.0, 10.0]; MAX_POINTS + 1]})).unwrap_err();
++    assert!(matches!(&err, EngineError::BadParams { msg, .. } if msg.contains("at most")), "{err}");
++}
++
++#[test]
++fn a_selection_edit_keeps_the_pixels_a_stroke_reads() {
++    let mut s = two_regions(8);
++    let p = json!({"size": 8});
++    let before = QuickSource::new(&s, &p).unwrap();
++    assert!(before.reads(s.active().unwrap()));
++    s.execute("select.all", json!({})).unwrap();
++    let after = QuickSource::new(&s, &p).unwrap();
++    assert!(!before.reads(s.active().unwrap()), "an edit makes a new document");
++    assert!(before.same_pixels(&after), "Select All left the pixels alone");
++    assert!(!before.same_pixels(&QuickSource::new(&s, &json!({"size": 9})).unwrap()), "another brush grows other regions");
++    assert!(!before.same_pixels(&QuickSource::new(&s, &json!({"size": 8, "sampleAllLayers": true})).unwrap()));
++    s.edit("paint", |doc, _| {
++        doc.layers[0].surface_mut().unwrap().fill_rect(Rect::new(0, 0, 10, 10), &[1.0, 0.0, 0.0, 1.0]);
++        Ok(())
++    })
++    .unwrap();
++    let painted = QuickSource::new(&s, &p).unwrap();
++    assert!(!after.same_pixels(&painted), "painted pixels grow other regions");
++    assert_eq!(QuickSource::on(&s, painted.doc(), &p).unwrap().doc(), painted.doc());
++}
+diff --git a/crates/engine/src/smartselect_cmds.rs b/crates/engine/src/smartselect_cmds.rs
+index 0a87379a..dd138232 100644
+--- a/crates/engine/src/smartselect_cmds.rs
++++ b/crates/engine/src/smartselect_cmds.rs
+@@ -94,10 +94,18 @@ const ENHANCE: RefineParams = RefineParams { radius: 4.0, smart_radius: true, sm
+ 
+ /// The region one Quick Selection segment (the polyline `pts`, brush diameter `size`) grows to on
+ /// `layer` of `doc` (or the composite), Auto-Enhanced with `enhance`; `None` when it misses.
+-pub(crate) fn quick_region(doc: &Document, layer: Option<LayerId>, all_layers: bool, pts: &[(f32, f32)], size: f32, enhance: bool) -> Option<Region> {
++pub(crate) fn quick_region(
++    doc: &Document,
++    layer: Option<LayerId>,
++    all_layers: bool,
++    pts: &[(f32, f32)],
++    size: f32,
++    enhance: bool,
++    speculate: usize,
++) -> Option<Region> {
+     with_doc_sampler(doc, layer, all_layers, |smp, doc| {
+         let canvas = doc.bounds();
+-        let r = quick::quick_select(smp, canvas, pts, size)?;
++        let r = quick::quick_select_speculating(smp, canvas, pts, size, speculate)?;
+         if enhance { matting::refine_mask(smp, &matting::region_reader(&r), r.bbox, canvas, &ENHANCE) } else { Some(r) }
+     })
+ }
+diff --git a/crates/ui-egui/examples/quick_selection_bench.rs b/crates/ui-egui/examples/quick_selection_bench.rs
+index cb7913c4..ba517829 100644
+--- a/crates/ui-egui/examples/quick_selection_bench.rs
++++ b/crates/ui-egui/examples/quick_selection_bench.rs
+@@ -1,22 +1,26 @@
+ //! Quick Selection drags on a 24 MP document (#9145): how often the outline updates while the
+-//! button is held, and the longest frame the UI thread spends, with the real `PhotocraftApp` in an
+-//! offscreen egui_kittest harness on wgpu. Pointer moves arrive at 60 Hz in real time (segments
+-//! grow on their worker meanwhile); each frame runs the app's logic (`--render` also paints it).
++//! button is held, how long after the release the stroke is committed, and the longest frame the
++//! UI thread spends, with the real `PhotocraftApp` in an offscreen egui_kittest harness on wgpu.
++//! Pointer moves arrive at 60 Hz in real time (segments grow on their worker meanwhile); each
++//! frame runs the app's logic (`--render` also paints it).
+ //!
+ //! ```sh
+ //! cargo run --release -p photocraft-ui-egui --example quick_selection_bench -- [--size 6000x4000]
+ //!     [--brush 30] [--frames 120] [--step 8] [--zoom 0.5] [--render] [--verbose] [--json out.json]
+ //! ```
+ //!
+-//! Scenarios, one after another on the same document:
++//! Scenarios, one after another on the same document (`--step` px of pointer travel per frame in
++//! x, about 350 document px a second at the default 8):
+ //! - `drag`: a stroke inside an object, released, until committed;
+ //! - `select all, subtract`: the same over Select All with the Subtract button (the whole image
+ //!   outlined, the "refine Select Subject" workflow);
+-//! - `press after release`: a new stroke pressed the frame after a release, while the first still
+-//!   grows;
+-//! - `command after release`: a command that edits the document (Deselect, cheap in itself) and
+-//!   view commands the frame after a release;
+-//! - `edit mid-drag`: ⌘D while the button is down, then the rest of the drag and the release.
++//! - `press after release`: a new stroke pressed the frame after a release, while the first is
++//!   still being committed (it follows it);
++//! - `command after release`: view commands and a command that edits the document (Select All,
++//!   refused while the stroke's commit runs, as for any job) the frame after a release;
++//! - `edit mid-drag`: ⌘D while the button is down, then the rest of the drag and the release;
++//! - `drag at step 16` / `drag at step 32`: brisk strokes (twice and four times as fast);
++//! - `edit mid-drag at step 32`: ⌘D during a brisk stroke.
+ //!
+ //! "Before" is what the release used to cost: the whole stroke as one `select.quick` on the UI
+ //! thread (no outline while dragging), timed on the same document and stroke.
+@@ -136,10 +140,15 @@ enum Extra {
+     EditMidDrag,
+     /// A second stroke pressed the frame after the release.
+     PressAfter,
+-    /// A document command and a view command the frame after the release.
++    /// View commands and a document command the frame after the release.
+     CommandAfter,
+ }
+ 
++/// The stroke at `step` px per frame over `frames` frames around (`cx`, `cy`): a wave left to right.
++fn path(cx: f64, cy: f64, step: f64, frames: usize) -> impl Fn(usize) -> (f64, f64) {
++    move |k: usize| (cx - 0.6 * step * frames as f64 / 2.0 + 0.6 * step * k as f64, cy + 0.3 * step * frames as f64 / 4.0 * (k as f64 / 15.0).sin())
++}
++
+ #[derive(Default)]
+ struct Run {
+     drag: Vec<f64>,
+@@ -151,8 +160,6 @@ struct Run {
+     after: Vec<f64>,
+     commit: f64,
+     settle: Vec<f64>,
+-    /// Commands ran in the commit frame (they waited for it): its time is theirs too.
+-    deferred: bool,
+     /// The frame (or call) of the extra action.
+     extra: Vec<f64>,
+     updates: usize,
+@@ -163,20 +170,15 @@ struct Run {
+ }
+ 
+ impl Run {
+-    /// The longest UI-thread frame the stroke itself cost (a command that waited for the commit
+-    /// runs in the commit frame, and costs what it costs at any time: not counted here).
++    /// The longest UI-thread frame (or call) of the stroke and its extra action.
+     fn longest(&self) -> f64 {
+-        let commit = if self.deferred { 0.0 } else { self.commit };
+-        self.drag.iter().chain(&self.after).chain(&self.extra).chain(&self.settle).copied().fold(self.press.max(self.release).max(commit), f64::max)
++        self.drag.iter().chain(&self.after).chain(&self.extra).chain(&self.settle).copied().fold(self.press.max(self.release).max(self.commit), f64::max)
+     }
+ 
+-    /// Every UI-thread frame of the stroke (see [`Run::longest`]).
++    /// Every UI-thread frame of the stroke.
+     fn frames(&self) -> Vec<f64> {
+         let mut v: Vec<f64> = self.drag.iter().chain(&self.after).chain(&self.settle).copied().collect();
+-        v.extend([self.press, self.release]);
+-        if !self.deferred {
+-            v.push(self.commit);
+-        }
++        v.extend([self.press, self.release, self.commit]);
+         v
+     }
+ }
+@@ -242,17 +244,19 @@ fn drag(h: &mut H, frames: usize, at: &dyn Fn(usize) -> (f64, f64), extra: Extra
+             run.extra.push(frame(h));
+         }
+         Extra::CommandAfter => {
+-            // A document edit (cheap in itself: Deselect) waits for the commit; view commands run.
+-            for id in ["select.deselect", "view.zoomIn", "view.zoomOut"] {
++            // View commands run; a document edit (Select All) is refused while the commit runs.
++            for id in ["view.zoomIn", "view.zoomOut", "select.all"] {
+                 let t = Instant::now();
+                 let r = h.state_mut().run(id, json!({}));
+-                assert!(r.is_ok(), "{id}: {r:?}");
+                 run.extra.push(ms(t));
++                assert!(r.is_ok() || id == "select.all", "{id}: {r:?}");
++                if let Err(e) = r {
++                    assert!(e.contains("still running"), "{id}: {e}");
++                }
+             }
+         }
+         _ => {}
+     }
+-    run.deferred = extra == Extra::CommandAfter;
+     while !quick_select_ui::idle(h.state()) && released.elapsed() < Duration::from_secs(60) {
+         let started = Instant::now();
+         let f = frame(h);
+@@ -283,12 +287,8 @@ fn report(name: &str, r: &Run) {
+         r.first_outline.unwrap_or(f64::NAN)
+     );
+     println!(
+-        "  press frame {:.2} ms, release frame {:.2} ms, committed {:.0} ms after the release, in a frame of {:.2} ms{}",
+-        r.press,
+-        r.release,
+-        r.committed_ms,
+-        r.commit,
+-        if r.deferred { " (with the commands that waited for it)" } else { "" }
++        "  press frame {:.2} ms, release frame {:.2} ms, committed {:.0} ms after the release, in a frame of {:.2} ms",
++        r.press, r.release, r.committed_ms, r.commit
+     );
+     stats("drag frames (UI thread)", &r.drag);
+     stats("time between outline updates", &r.gaps);
+@@ -338,7 +338,7 @@ fn main() {
+     }
+     // The strokes: inside the big red disc, a wave left to right.
+     let (cx, cy) = (0.3 * w as f64, 0.5 * hh as f64);
+-    let at = move |k: usize| (cx - 0.6 * step * frames as f64 / 2.0 + 0.6 * step * k as f64, cy + 0.3 * step * frames as f64 / 4.0 * (k as f64 / 15.0).sin());
++    let at = path(cx, cy, step, frames);
+     {
+         let app = h.state_mut();
+         app.ui.tool = Tool::QuickSelection;
+@@ -390,6 +390,19 @@ fn main() {
+     let edit = drag(&mut h, frames, &at, Extra::EditMidDrag);
+     report("edit mid-drag", &edit);
+     reset(&mut h);
++    // Brisk strokes.
++    let fast16 = drag(&mut h, frames, &path(cx, cy, 2.0 * step, frames), Extra::None);
++    report("drag at step 16", &fast16);
++    reset(&mut h);
++    let fast32 = drag(&mut h, frames, &path(cx, cy, 4.0 * step, frames), Extra::None);
++    report("drag at step 32", &fast32);
++    reset(&mut h);
++    let r = h.state_mut().run("select.rect", json!({"x": 10, "y": 10, "width": 200, "height": 200}));
++    assert!(r.is_ok(), "select.rect: {r:?}");
++    settle(&mut h);
++    let edit32 = drag(&mut h, frames, &path(cx, cy, 4.0 * step, frames), Extra::EditMidDrag);
++    report("edit mid-drag at step 32", &edit32);
++    reset(&mut h);
+ 
+     // Before: no outline while dragging, the whole stroke selected at once on the release.
+     let mut whole = plain.params.clone();
+@@ -407,23 +420,35 @@ fn main() {
+     }
+     println!("before: 0 outline updates while dragging; the release ran the whole stroke on the UI thread:");
+     stats("release (select.quick, whole stroke)", &once);
+-    let longest = [&plain, &subtract, &repress, &command, &edit].iter().map(|r| r.longest()).fold(0.0, f64::max);
++    let all = [&plain, &subtract, &repress, &command, &edit, &fast16, &fast32, &edit32];
++    let longest = all.iter().map(|r| r.longest()).fold(0.0, f64::max);
+     println!("after: longest UI-thread frame in every scenario {longest:.2} ms");
+ 
+     if let Some(out) = json_out {
+         let row = photocraft_testkit::perf::row;
+         let mut after_edit = edit.frames();
+         after_edit.extend(&edit.extra);
++        // Every UI-thread frame of the brisk strokes, ⌘D included.
++        let mut fast_frames = fast16.frames();
++        fast_frames.extend(fast32.frames());
++        fast_frames.extend(edit32.frames());
++        fast_frames.extend(&edit32.extra);
+         let rows = vec![
+             row("drag frame", &plain.frames(), None, None),
+-            row("outline update interval", &plain.gaps, None, None),
++            row("outline update interval", &fast16.gaps, None, None),
++            row("outline update interval, step 8", &plain.gaps, None, None),
+             row("drag frame, select all subtract", &subtract.frames(), None, None),
+             row("press after release", &repress.extra, None, None),
+             row("command after release", &command.extra, None, None),
+             row("frames after a mid-drag edit", &after_edit, None, None),
++            row("drag frame, brisk strokes", &fast_frames, None, None),
++            row("commit after release, step 8", &[plain.committed_ms], None, None),
++            row("commit after release, step 16", &[fast16.committed_ms], None, None),
++            row("commit after release, step 32", &[fast32.committed_ms], None, None),
++            row("commit after release, edit mid-drag at step 32", &[edit32.committed_ms], None, None),
+             row("before: release of the whole stroke", &once, None, None),
+         ];
+-        let context = json!({"width": w, "height": hh, "brush": brush, "frames": frames});
++        let context = json!({"width": w, "height": hh, "brush": brush, "frames": frames, "step": step});
+         let report = photocraft_testkit::perf::report("quick_selection_bench", context, rows, None);
+         if let Err(e) = photocraft_testkit::perf::write_report(&out, &report) {
+             eprintln!("{e}");
+diff --git a/crates/ui-egui/src/jobs_ui.rs b/crates/ui-egui/src/jobs_ui.rs
+index 980aff20..5335cf0c 100644
+--- a/crates/ui-egui/src/jobs_ui.rs
++++ b/crates/ui-egui/src/jobs_ui.rs
+@@ -471,6 +471,10 @@ fn on_event(app: &mut PhotocraftApp, ctx: &egui::Context, e: JobEvent) {
+     });
+     // A Free Transform commit's session ends with its job (then reported like any job).
+     crate::transform_tool::on_job_event(app, &e);
++    // A Quick Selection stroke's commit: reported as a stroke, and the next stroke may go.
++    if crate::quick_select_ui::on_job_event(app, &e) {
++        return;
++    }
+     if crate::prefs_ui::on_recovery_event(app, &e) {
+         return;
+     }
+@@ -735,7 +739,9 @@ pub fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
+         Some(j) => j,
+         None => {
+             let Some(j) = app.session.active_job() else { return };
+-            if j.elapsed_ms < DIALOG_DELAY_MS || app.jobs.saves.iter().any(|s| s.job == j.id) {
++            // A Quick Selection stroke finishing after its release shows its progress in the
++            // status bar only: a modal dialog would stop the next stroke (`quick_select_ui`).
++            if j.elapsed_ms < DIALOG_DELAY_MS || app.jobs.saves.iter().any(|s| s.job == j.id) || crate::quick_select_ui::commits(app, j.id) {
+                 return;
+             }
+             j
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 5428c11b..91aaee06 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -1300,11 +1300,6 @@ impl PhotocraftApp {
+     }
+ 
+     fn run_command(&mut self, id: &str, params: Value) -> Result<Value, String> {
+-        // A released Quick Selection stroke still growing comes first: a command that edits the
+-        // document waits for its commit.
+-        if let Some(r) = quick_select_ui::defer(self, id, &params) {
+-            return r;
+-        }
+         if !vector_ui::cancel_stale(self) {
+             return Err(self.ui.status.clone());
+         }
+diff --git a/crates/ui-egui/src/quick_select_ui.rs b/crates/ui-egui/src/quick_select_ui.rs
+index 8666e221..5d34b2eb 100644
+--- a/crates/ui-egui/src/quick_select_ui.rs
++++ b/crates/ui-egui/src/quick_select_ui.rs
+@@ -4,22 +4,26 @@
+ //!
+ //! A stroke is selected segment by segment (`photocraft_engine::quick_stroke`), cut by the
+ //! pointer's travel alone (`Cutter`), so the same motion gives the same selection on any machine,
+-//! and each segment is led by the stroke's last segment of travel. On the desktop a segment grows on a
+-//! worker thread, in a thread pool of its own, and the worker also traces the new outline for the
+-//! view, so the UI thread never waits for either; on the web (no threads) a segment grows on the
+-//! UI thread, throttled so it takes at most a third of the time ([`Throttle`]); with background
+-//! jobs off (tests, `PHOTOCRAFT_INLINE_JOBS`) it grows inline. The canvas outlines the stroke's
+-//! selection so far ([`shown`]) instead of the document's.
++//! and each segment is led by the stroke's last segment of travel. On the desktop a stroke has a
++//! worker thread: the regions of the segments sent to it grow at once on a thread pool of their
++//! own (a region depends only on the pixels and the segment), are combined in order, and the
++//! worker traces the new outline for the view, so the UI thread never waits for any of it. On the
++//! web (no threads) a segment grows on the UI thread, throttled so it takes at most a third of
++//! the time ([`Throttle`]); with background jobs off (tests, `PHOTOCRAFT_INLINE_JOBS`) it grows
++//! inline. The canvas outlines the stroke's selection so far ([`shown`]) instead of the
++//! document's.
+ //!
+-//! When the button goes up the last points become the final segment. Once every segment has
+-//! grown the stroke is committed as one `select.quick` (one history step, "Quick Selection") whose
+-//! `segments` record the cut, offered the live result so nothing grows twice: what the canvas
+-//! showed is what is committed, and replaying the journal makes the same selection. Nothing waits
+-//! for that on the UI thread: a new stroke started meanwhile queues behind the one still growing
+-//! and starts from its result, and a command that edits the document runs once it has been
+-//! committed, in order ([`defer`]); view and tool commands run at once. A document edited under a
+-//! stroke being dragged (⌘Z, ⌘D) rebases it: its segments grow again on the new document, on the
+-//! worker.
++//! When the button goes up the last points become the final segment and the stroke is committed
++//! as one `select.quick` on the document it was drawn on, whichever is active (one history step,
++//! "Quick Selection"), whose `segments` record the cut: replaying the journal makes the same
++//! selection. The command takes the live stroke ([`QuickCommit`]); while segments are still
++//! growing it is a background job, "Quick Selection", that waits for them, as any job on its
++//! document: commands that would edit that document are refused until it has been applied
++//! ("… is still running on this document"), Esc cancels it, and other documents, views and tools
++//! are not held up. A new stroke pressed on that document meanwhile follows it: it starts once
++//! the job is done, from its result. A document edited under a stroke being dragged (⌘Z, ⌘D)
++//! rebases it: its segments are combined again on the new document, on the worker (grown again
++//! only if its pixels changed).
+ //!
+ //! Modes, as on Photoshop's options bar: New, Add and Subtract (Quick Selection has no Intersect).
+ //! ⌥ subtracts and ⇧ adds while held, read as the stroke goes: ⌥ pressed during the drag (on
+@@ -31,7 +35,8 @@ use std::sync::Arc;
+ use egui::Modifiers;
+ use photocraft_algo::selection::SelectionMode;
+ use photocraft_doc::DocId;
+-use photocraft_engine::quick_stroke::{self, Cutter, QuickCommit, QuickSource, QuickStroke};
++use photocraft_engine::jobs::{JobEvent, JobId, JobOutcome};
++use photocraft_engine::quick_stroke::{self, Cutter, Finish, QuickCommit, QuickSource, QuickStroke};
+ use photocraft_geom::Rect;
+ use photocraft_raster::Surface;
+ use serde_json::{Value, json};
+@@ -59,6 +64,10 @@ fn bounds(stroke: &QuickStroke) -> Rect {
+     stroke.selection().map_or(Rect::EMPTY, Surface::content_bounds)
+ }
+ 
++fn failed_message() -> String {
++    tl!("Quick Selection failed with an internal error; the selection is unchanged").to_string()
++}
++
+ /// The threads segments grow on: one fewer than the machine has (at least one), apart from the
+ /// global pool, so the UI thread's own parallel work (tracing an outline, compositing on the CPU)
+ /// never queues behind a segment's cuts. Made once, on the first stroke.
+@@ -116,152 +125,80 @@ pub(crate) struct OutlineView {
+ /// An outline traced on a worker: document, cache key and segments.
+ type Traced = (DocId, u64, Arc<Vec<crate::outline::Segment>>);
+ 
+-/// What a worker hands back for a segment.
+-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+-struct Grown {
+-    /// The stroke's base when the segment was sent (a rebase makes it stale).
+-    generation: u64,
+-    stroke: QuickStroke,
++/// What the canvas shows of a stroke: its selection so far (shared, no copy), its content bounds
++/// and, traced off the UI thread, its outline.
++#[derive(Clone)]
++struct Preview {
+     sel: Option<Arc<Surface>>,
+     bounds: Rect,
+     outline: Option<Traced>,
+ }
+ 
+-/// Work for a stroke's worker.
+-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+-enum Task {
+-    /// Start (again) from `stroke` on `src`: the stroke began, or was rebased.
+-    Reset { generation: u64, src: QuickSource, stroke: QuickStroke },
+-    /// Grow the next segment, and trace the outline for `view`.
+-    Grow { pts: Vec<(f32, f32)>, mode: SelectionMode, view: Option<OutlineView> },
+-}
++/// The latest preview of a stroke handed to its commit job (which receives what its worker
++/// grows from then on), for the canvas.
++type Handed = Arc<std::sync::Mutex<Option<Preview>>>;
+ 
+-/// A stroke's worker thread (never on the web, which grows segments inline): it grows the
+-/// segments in order as they are sent, without waiting for the UI between them, and hands back
+-/// the stroke after each.
+-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+-struct Worker {
+-    #[cfg(not(target_arch = "wasm32"))]
+-    tx: std::sync::mpsc::Sender<Task>,
+-    #[cfg(not(target_arch = "wasm32"))]
+-    rx: std::sync::mpsc::Receiver<Option<Grown>>,
+-}
+-
+-/// Test hooks a worker honours: a lock it takes before each segment, and failing.
+-#[cfg(test)]
+-type Hooks = (Option<Arc<std::sync::RwLock<()>>>, bool);
++#[cfg(not(target_arch = "wasm32"))]
++mod worker;
+ 
+-impl Worker {
+-    /// Start a worker; `None` when no thread can be had (the segments then grow inline).
+-    #[cfg(not(target_arch = "wasm32"))]
+-    fn start(ctx: Option<egui::Context>, #[cfg(test)] hooks: Hooks) -> Option<Self> {
+-        let (tx, tasks) = std::sync::mpsc::channel::<Task>();
+-        let (done, rx) = std::sync::mpsc::channel::<Option<Grown>>();
+-        let work = move || {
+-            let mut state: Option<(u64, QuickSource, QuickStroke)> = None;
+-            while let Ok(task) = tasks.recv() {
+-                let (pts, mode, view) = match task {
+-                    Task::Reset { generation, src, stroke } => {
+-                        state = Some((generation, src, stroke));
+-                        continue;
+-                    }
+-                    Task::Grow { pts, mode, view } => (pts, mode, view),
+-                };
+-                let Some((generation, src, stroke)) = state.as_mut() else { continue };
+-                #[cfg(test)]
+-                let _held = hooks.0.as_ref().map(|g| g.read().unwrap_or_else(std::sync::PoisonError::into_inner));
+-                let mut grow = || {
+-                    #[cfg(test)]
+-                    if hooks.1 {
+-                        std::panic::resume_unwind(Box::new("a failing worker (test)"));
+-                    }
+-                    stroke.push(src, &pts, mode);
+-                    let bounds = bounds(stroke);
+-                    let outline = view.zip(stroke.selection()).map(|(v, sel)| {
+-                        let segs = crate::outline::outline_scaled(sel, bounds.intersect(&v.vis), v.step);
+-                        (v.doc, crate::canvas::outline_key(sel, v.step, v.doc, v.vis, 1), Arc::new(segs))
+-                    });
+-                    let sel = stroke.selection().cloned().map(Arc::new);
+-                    Grown { generation: *generation, stroke: stroke.clone(), sel, bounds, outline }
+-                };
+-                let grown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match pool() {
+-                    Some(pool) => pool.install(grow),
+-                    None => grow(),
+-                }))
+-                .ok();
+-                // A failed segment leaves the stroke half-grown: grow nothing more of it.
+-                if grown.is_none() {
+-                    state = None;
+-                }
+-                if done.send(grown).is_err() {
+-                    return;
+-                }
+-                if let Some(ctx) = &ctx {
+-                    ctx.request_repaint();
+-                }
+-            }
+-        };
+-        std::thread::Builder::new().name("quick-selection".into()).spawn(work).ok()?;
+-        Some(Self { tx, rx })
+-    }
+-}
++#[cfg(not(target_arch = "wasm32"))]
++use worker::{Back, Task, Worker};
+ 
+-/// A Quick Selection stroke: being dragged, or released and still growing.
++/// A Quick Selection stroke: being dragged, released and being committed, or waiting to start.
+ pub(crate) struct QuickLive {
+     doc: DocId,
+     /// `select.quick`'s settings (brush size, Sample All Layers, Enhance Edge), as at the press.
+     settings: Value,
+-    src: QuickSource,
++    /// What the stroke reads; `None` until it can start (see [`advance`]).
++    src: Option<QuickSource>,
+     /// Bumped when the stroke is rebased on an edited document.
+     generation: u64,
+-    /// The stroke after the segments grown on the current base: what the canvas outlines.
++    /// The rebase kept the pixels: the worker may combine the regions it already grew again.
++    keep_regions: bool,
++    /// The stroke after the segments combined on the current base.
+     shown: QuickStroke,
+-    /// Its selection, shared with the canvas, and its content bounds (both made with it, off the
+-    /// UI thread).
+-    shown_sel: Option<Arc<Surface>>,
+-    shown_bounds: Rect,
+-    /// Segments grown on the current base (until one has, the canvas shows the document's).
++    /// What the canvas outlines.
++    preview: Preview,
++    /// Updates on the current base (until one, the canvas shows the document's selection).
+     grown: usize,
+     /// The stroke's points (valid ones, document px), the drag points read so far, and the cut.
+     points: Vec<(f32, f32)>,
+     read: usize,
+     cutter: Cutter,
+-    /// Closed segments sent to grow (done or growing), and the points they cover.
++    /// Closed segments sent to grow on the current base, and the points they cover.
+     sent: usize,
+     sent_points: usize,
+-    /// The worker, the base it was last told to start from, and the segments sent to it since
+-    /// that have not come back.
++    /// The stroke's worker, and the base it was last told to start from.
++    #[cfg(not(target_arch = "wasm32"))]
+     worker: Option<Worker>,
++    #[cfg(not(target_arch = "wasm32"))]
+     worker_generation: Option<u64>,
+-    in_flight: usize,
+-    /// The button is up: commit once every segment has grown.
++    /// The button is up.
+     released: bool,
+-    /// A segment failed: the stroke shows nothing more and is dropped on release.
++    /// The `select.quick` job committing the stroke, and the preview it passes on meanwhile.
++    job: Option<(JobId, Handed)>,
++    /// Growing failed: the stroke shows nothing more and is dropped on release.
+     failed: bool,
+-    /// Commands that came after the release, run once the stroke is committed ([`defer`]).
+-    after: Vec<(String, Value)>,
+-    /// The outline changed this many times (a segment grew).
++    /// The outline changed this many times.
+     pub(crate) updates: usize,
+     throttle: Throttle,
+-    /// Woken when a worker finishes.
++    /// Woken when a worker has grown something.
+     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+     ctx: Option<egui::Context>,
+-    #[cfg(test)]
+-    hooks: (Option<Arc<std::sync::RwLock<()>>>, bool),
++    #[cfg(all(test, not(target_arch = "wasm32")))]
++    hooks: worker::Hooks,
+ }
+ 
+-/// The Quick Selection strokes of the session (`PhotocraftApp::quick`): the oldest grows and
+-/// commits first; the others wait behind it.
++/// The Quick Selection strokes of the session (`PhotocraftApp::quick`), in the order they were
++/// pressed: a stroke waits for the earlier ones on its document.
+ #[derive(Default)]
+ pub(crate) struct QuickState {
+     strokes: Vec<QuickLive>,
+-    /// A stroke's commit (and the commands that waited for it) is running: nothing is deferred.
+-    committing: bool,
+     pub(crate) outline_view: Option<OutlineView>,
+     /// Control replies (`ui.pointer`) waiting for the strokes they released to be committed.
+     waiters: Vec<std::sync::mpsc::Sender<ControlResponse>>,
+     /// Test hooks: the last commit's result; segments grown on the UI thread while background
+-    /// jobs are on (there must be none); a lock workers wait on before growing; workers that fail.
++    /// jobs are on (there must be none); a lock region growth waits on; workers that fail.
+     #[cfg(test)]
+     pub(crate) last_commit: Option<Result<Value, String>>,
+     #[cfg(test)]
+@@ -270,42 +207,60 @@ pub(crate) struct QuickState {
+     pub(crate) gate: Option<Arc<std::sync::RwLock<()>>>,
+     #[cfg(test)]
+     pub(crate) fail_workers: bool,
++    /// Test hook: regions workers have grown.
++    #[cfg(test)]
++    pub(crate) regions_grown: Arc<std::sync::atomic::AtomicUsize>,
+ }
+ 
+ impl QuickLive {
+-    fn new(doc: DocId, settings: Value, src: QuickSource) -> Self {
+-        let shown = QuickStroke::new(src.selection().cloned());
+-        let cutter = Cutter::new(src.size());
++    fn new(doc: DocId, settings: Value) -> Self {
++        let size = settings.get("size").and_then(Value::as_f64).map_or(30.0, |v| v as f32);
+         Self {
+             doc,
+             settings,
+-            src,
++            src: None,
+             generation: 0,
+-            shown_sel: shown.selection().cloned().map(Arc::new),
+-            shown_bounds: bounds(&shown),
+-            shown,
++            keep_regions: false,
++            shown: QuickStroke::new(None),
++            preview: Preview { sel: None, bounds: Rect::EMPTY, outline: None },
+             grown: 0,
+             points: Vec::new(),
+             read: 0,
+-            cutter,
++            cutter: Cutter::new(size),
+             sent: 0,
+             sent_points: 0,
++            #[cfg(not(target_arch = "wasm32"))]
+             worker: None,
++            #[cfg(not(target_arch = "wasm32"))]
+             worker_generation: None,
+-            in_flight: 0,
+             released: false,
++            job: None,
+             failed: false,
+-            after: Vec::new(),
+             updates: 0,
+             throttle: Throttle::default(),
+             ctx: None,
+-            #[cfg(test)]
+-            hooks: (None, false),
++            #[cfg(all(test, not(target_arch = "wasm32")))]
++            hooks: (None, false, Arc::default()),
+         }
+     }
+ 
++    /// Start (again) from `src`: from its selection, every closed segment to be grown.
++    fn start(&mut self, src: QuickSource) {
++        self.keep_regions = self.src.as_ref().is_some_and(|old| old.same_pixels(&src));
++        self.shown = QuickStroke::new(src.selection().cloned());
++        self.preview = Preview { sel: self.shown.selection().cloned().map(Arc::new), bounds: bounds(&self.shown), outline: None };
++        if self.src.is_some() {
++            self.generation += 1;
++        }
++        self.src = Some(src);
++        self.grown = 0;
++        self.sent = 0;
++        self.sent_points = 0;
++    }
++
++    /// Segments sent on the current base and not combined yet.
+     fn busy(&self) -> bool {
+-        self.in_flight > 0 && !self.failed
++        self.job.is_none() && !self.failed && self.shown.combined() < self.sent
+     }
+ 
+     /// Read the drag points not read yet, painted in `mode`, into the cut.
+@@ -335,40 +290,27 @@ impl QuickLive {
+         Some((pts, mode))
+     }
+ 
+-    /// Every closed segment has grown (and, released, the cut is complete).
+-    fn caught_up(&self) -> bool {
+-        !self.busy() && self.sent == self.cutter.closed().len()
+-    }
+-
+-    /// The document changed under the stroke: grow its segments again from the start, on what the
+-    /// document is now (a segment growing for the old one is dropped when it arrives).
+-    fn rebase(&mut self, session: &photocraft_engine::Session) -> Result<(), String> {
+-        self.src = QuickSource::new(session, &self.settings).map_err(|e| e.to_string())?;
+-        self.generation += 1;
+-        self.shown = QuickStroke::new(self.src.selection().cloned());
+-        self.shown_sel = self.shown.selection().cloned().map(Arc::new);
+-        self.shown_bounds = bounds(&self.shown);
+-        self.grown = 0;
+-        self.sent = 0;
+-        self.sent_points = 0;
+-        // Segments still growing for the old base are dropped when they come back.
+-        self.in_flight = 0;
+-        Ok(())
++    /// A new state of the stroke on the current base.
++    fn show(&mut self, stroke: QuickStroke, preview: Preview) {
++        self.shown = stroke;
++        self.preview = preview;
++        self.grown += 1;
++        self.updates += 1;
+     }
+ 
+     /// Grow `pts` in `mode` now, on this thread.
+-    fn grow_inline(&mut self, pts: &[(f32, f32)], mode: SelectionMode) {
+-        self.shown.push(&self.src, pts, mode);
+-        self.shown_sel = self.shown.selection().cloned().map(Arc::new);
+-        self.shown_bounds = bounds(&self.shown);
+-        self.grown += 1;
+-        self.updates += 1;
++    fn grow_inline(&mut self, src: &QuickSource, pts: &[(f32, f32)], mode: SelectionMode) {
++        let mut stroke = std::mem::replace(&mut self.shown, QuickStroke::new(None));
++        stroke.push(src, pts, mode);
++        let preview = Preview { sel: stroke.selection().cloned().map(Arc::new), bounds: bounds(&stroke), outline: None };
++        self.show(stroke, preview);
+     }
+ 
+     /// Send every closed segment not sent yet to the worker (starting it, and telling it the base,
+     /// first), its outline to be traced for `view`. False when there is no worker to be had.
+     #[cfg(not(target_arch = "wasm32"))]
+     fn send(&mut self, view: Option<OutlineView>) -> bool {
++        let Some(src) = self.src.clone() else { return false };
+         if self.worker.is_none() {
+             #[cfg(test)]
+             let worker = Worker::start(self.ctx.clone(), self.hooks.clone());
+@@ -376,57 +318,48 @@ impl QuickLive {
+             let worker = Worker::start(self.ctx.clone());
+             self.worker = worker;
+         }
+-        let Some(tx) = self.worker.as_ref().map(|w| w.tx.clone()) else { return false };
++        let Some(w) = self.worker.as_ref() else { return false };
+         if self.worker_generation != Some(self.generation) {
+-            let reset = Task::Reset { generation: self.generation, src: self.src.clone(), stroke: self.shown.clone() };
+-            if tx.send(reset).is_err() {
++            let reset = Task::Reset { generation: self.generation, src, stroke: self.shown.clone(), keep_regions: self.keep_regions };
++            if !w.send(reset) {
+                 return false;
+             }
+             self.worker_generation = Some(self.generation);
+         }
++        let generation = self.generation;
+         while let Some((pts, mode)) = self.next() {
+-            if tx.send(Task::Grow { pts, mode, view }).is_err() {
++            let Some(w) = self.worker.as_ref() else { return false };
++            if !w.send(Task::Grow { generation, pts, mode, view }) {
+                 return false;
+             }
+-            self.in_flight += 1;
+         }
+         true
+     }
+ 
+-    /// Take the segments the worker has grown (`wait`: block until one comes, if any is growing):
+-    /// the last traced outline, if any. An error when the worker failed.
++    /// Take what the worker has combined (`wait`: block until something comes, if anything is
++    /// growing): the last traced outline, if any. An error when growing failed.
+     #[cfg(not(target_arch = "wasm32"))]
+     fn collect(&mut self, wait: bool) -> Result<Option<Traced>, String> {
+-        let failed = || tl!("Quick Selection failed with an internal error; the selection is unchanged").to_string();
+-        let Some(worker) = &self.worker else { return Ok(None) };
+         let mut outline = None;
+-        let mut block = wait && self.in_flight > 0;
++        let mut block = wait && self.busy();
+         loop {
+-            let got = if block { worker.rx.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected) } else { worker.rx.try_recv() };
++            let Some(worker) = &self.worker else { return Ok(outline) };
++            let got = if block { worker.recv() } else { worker.try_recv() };
+             block = false;
+-            let grown = match got {
+-                Ok(Some(g)) => g,
+-                // The worker grows nothing more of this stroke.
+-                Ok(None) => {
+-                    self.in_flight = 0;
+-                    return Err(failed());
+-                }
+-                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(outline),
+-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+-                    let lost = std::mem::take(&mut self.in_flight) > 0;
+-                    return if lost { Err(failed()) } else { Ok(outline) };
++            match got {
++                Some(Back::Grown { generation, stroke, preview }) => {
++                    // Combined on a base the stroke has since left: dropped.
++                    if generation == self.generation {
++                        outline = preview.outline.clone().or(outline);
++                        self.show(*stroke, preview);
++                    }
+                 }
+-            };
+-            if grown.generation != self.generation {
+-                continue;
++                // Only a failure on the current base ends the stroke.
++                Some(Back::Failed { generation }) if generation == self.generation => return Err(failed_message()),
++                Some(Back::Failed { .. }) => {}
++                None if worker.gone() && self.busy() => return Err(failed_message()),
++                None => return Ok(outline),
+             }
+-            self.in_flight = self.in_flight.saturating_sub(1);
+-            self.shown_bounds = grown.bounds;
+-            self.shown_sel = grown.sel;
+-            self.shown = grown.stroke;
+-            self.grown += 1;
+-            self.updates += 1;
+-            outline = grown.outline.or(outline);
+         }
+     }
+ 
+@@ -434,6 +367,46 @@ impl QuickLive {
+     fn collect(&mut self, _wait: bool) -> Result<Option<Traced>, String> {
+         Ok(None)
+     }
++
++    /// How `select.quick` gets this released stroke: in full when every segment has been
++    /// combined, else from whoever grows the rest (its worker, or the command's job itself).
++    fn offer(&mut self) -> Option<(QuickCommit, Option<Handed>)> {
++        let src = self.src.clone()?;
++        let total = self.cutter.closed().len();
++        if self.shown.combined() == total && self.shown.segments() == self.cutter.closed() {
++            return Some((QuickCommit::new(src, self.shown.clone()), None));
++        }
++        let (points, segments) = (self.points.clone(), self.cutter.closed().to_vec());
++        #[cfg(not(target_arch = "wasm32"))]
++        if let Some(worker) = self.worker.take() {
++            let handed: Handed = Arc::default();
++            let finish = worker.finish(self.generation, total, Arc::clone(&handed));
++            return Some((QuickCommit::growing(src, points, segments, finish), Some(handed)));
++        }
++        // No worker (the web, or none could be had): the job grows the segments not grown yet.
++        let mut stroke = self.shown.clone();
++        let mut at = self.sent_points;
++        let rest: Vec<(Vec<(f32, f32)>, SelectionMode)> = segments
++            .get(self.sent..)
++            .unwrap_or_default()
++            .iter()
++            .map(|&(n, m)| {
++                let end = at.saturating_add(n).min(points.len());
++                let pts = points.get(at..end).unwrap_or_default().to_vec();
++                at = end;
++                (pts, m)
++            })
++            .collect();
++        let grows = src.clone();
++        let finish: Finish = Box::new(move |ctx| {
++            for (pts, m) in rest {
++                ctx.check()?;
++                stroke.push(&grows, &pts, m);
++            }
++            Ok(stroke)
++        });
++        Some((QuickCommit::growing(src, points, segments, finish), None))
++    }
+ }
+ 
+ /// `select.quick`'s settings from the options bar and the brush, without the stroke.
+@@ -442,31 +415,28 @@ pub(crate) fn settings(app: &PhotocraftApp) -> Value {
+     json!({"size": app.session.tools.brush.size, "sampleAllLayers": o.sample_all.quick_selection, "enhanceEdge": o.enhance_edge})
+ }
+ 
+-/// Start the live stroke of the Quick Selection drag that just began (`app.drag`): it queues
+-/// behind any stroke still growing. Without one (no document, say) the release selects the whole
+-/// stroke at once, as before.
++/// Start the live stroke of the Quick Selection drag that just began (`app.drag`), on the active
++/// document. Without one (no document) the release selects the whole stroke at once, as before.
+ pub(crate) fn begin(app: &mut PhotocraftApp) {
+     // Any stroke still marked as dragged lost its release: this press starts the next one.
+     end_lost_drags(app, false);
+     if !app.drag.as_ref().is_some_and(|d| d.tool == Tool::QuickSelection) {
+         return;
+     }
+-    let settings = settings(app);
+     let Some(doc) = app.session.active().map(|st| st.doc.id) else { return };
+-    let Ok(src) = QuickSource::new(&app.session, &settings) else { return };
+     #[allow(unused_mut)]
+-    let mut live = QuickLive::new(doc, settings, src);
+-    #[cfg(test)]
++    let mut live = QuickLive::new(doc, settings(app));
++    #[cfg(all(test, not(target_arch = "wasm32")))]
+     {
+-        live.hooks = (app.quick.gate.clone(), app.quick.fail_workers);
++        live.hooks = (app.quick.gate.clone(), app.quick.fail_workers, Arc::clone(&app.quick.regions_grown));
+     }
+     app.quick.strokes.push(live);
+     pump(app);
+ }
+ 
+-/// A stroke still marked as dragged whose drag ended some other way (a lost release, a closed
+-/// document) is released: it commits what it has. With `keep_current`, the newest stroke stays
+-/// as it is while a Quick Selection drag is under way (it is that drag's).
++/// A stroke still marked as dragged whose drag ended some other way (a lost release) is
++/// released: it commits what it has. With `keep_current`, the newest stroke stays as it is while
++/// a Quick Selection drag is under way (it is that drag's).
+ fn end_lost_drags(app: &mut PhotocraftApp, keep_current: bool) {
+     let dragging = keep_current && app.drag.as_ref().is_some_and(|d| d.tool == Tool::QuickSelection);
+     let current = app.quick.strokes.len().checked_sub(1);
+@@ -477,10 +447,10 @@ fn end_lost_drags(app: &mut PhotocraftApp, keep_current: bool) {
+     }
+ }
+ 
+-/// Grows whatever is ready: reads the drag's new points into the cut, takes a finished segment,
+-/// rebases a stroke whose document changed, starts the next segment, commits a released stroke
+-/// once it has caught up and then lets the next one go. Called for every batch of pointer moves
+-/// and once a frame ([`tick`]).
++/// Grows whatever is ready: reads the drag's new points into the cut, starts strokes whose
++/// document is free, takes what workers have grown, rebases a stroke being dragged whose document
++/// changed, sends new segments, and hands released strokes to their commit. Called for every
++/// batch of pointer moves, once a frame ([`tick`]) and when a commit job ends.
+ pub(crate) fn pump(app: &mut PhotocraftApp) {
+     let bar = app.ui.quick_selection_mode;
+     if let Some(d) = app.drag.as_ref().filter(|d| d.tool == Tool::QuickSelection)
+@@ -488,7 +458,14 @@ pub(crate) fn pump(app: &mut PhotocraftApp) {
+     {
+         live.read(&d.points, segment_mode(bar, d.live));
+     }
+-    while step(app) {}
++    let mut i = 0;
++    while i < app.quick.strokes.len() {
++        if advance(app, i) {
++            i += 1;
++        } else {
++            app.quick.strokes.remove(i);
++        }
++    }
+     if !finishing(app) {
+         let status = app.ui.status.clone();
+         for w in app.quick.waiters.drain(..) {
+@@ -497,134 +474,187 @@ pub(crate) fn pump(app: &mut PhotocraftApp) {
+     }
+ }
+ 
+-/// Advance the oldest stroke. True when it has been committed (or dropped): the next one may go.
+-fn step(app: &mut PhotocraftApp) -> bool {
++/// Advance stroke `i`; false when it is done with (committed, failed and released, or its
++/// document closed).
++fn advance(app: &mut PhotocraftApp, i: usize) -> bool {
+     let inline = cfg!(target_arch = "wasm32") || !app.background_jobs;
+     let now = app.last_frame_time * 1000.0;
+-    let active = app.session.active().map(|st| (st.doc.id, st.revision));
+     let view = app.quick.outline_view;
+-    let Some(front) = app.quick.strokes.first_mut() else { return false };
+-    if front.failed {
+-        if !front.released {
+-            return false;
++    let Some(doc) = app.quick.strokes.get(i).map(|l| l.doc) else { return false };
++    // Its document closed (which cancels a commit job on it): nothing left to select.
++    if !app.session.documents().iter().any(|st| st.doc.id == doc) {
++        return false;
++    }
++    let earlier = app.quick.strokes.get(..i).is_some_and(|before| before.iter().any(|l| l.doc == doc));
++    let locked = app.session.job_on(doc).is_some();
++    let Some(live) = app.quick.strokes.get_mut(i) else { return false };
++    // Handed to its commit job: the canvas shows what it passes on until it is applied.
++    if let Some((job, handed)) = &live.job {
++        let latest = handed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
++        let running = app.session.job(*job).is_some();
++        if let Some(p) = latest {
++            if let Some(o) = p.outline.clone() {
++                app.outline_cache = Some(o);
++            }
++            live.preview = p;
++            live.grown += 1;
++            live.updates += 1;
+         }
+-        drop_front(app);
+-        return true;
++        return running;
++    }
++    if live.failed {
++        return !live.released;
+     }
+-    match front.collect(false) {
++    // A stroke follows the commit jobs and the earlier strokes on its document: it starts from
++    // their result.
++    if live.src.is_none() {
++        if earlier || locked {
++            return true;
++        }
++        match QuickSource::on(&app.session, doc, &live.settings) {
++            Ok(src) => live.start(src),
++            Err(e) => {
++                app.ui.status = e.to_string();
++                app.ui.status_error = true;
++                return false;
++            }
++        }
++    }
++    match live.collect(false) {
+         Ok(Some(outline)) => app.outline_cache = Some(outline),
+         Ok(None) => {}
+         Err(e) => {
+-            front.failed = true;
++            live.failed = true;
+             app.ui.status = e;
+             app.ui.status_error = true;
+-            return false;
++            return !live.released;
+         }
+     }
+-    match active {
+-        Some((doc, revision)) if doc == front.doc => {
+-            if front.src.base().1 != revision
+-                && let Err(e) = front.rebase(&app.session)
+-            {
+-                front.failed = true;
+-                app.ui.status = e;
++    // The document changed under the drag (⌘Z, ⌘D): start again on what it is now.
++    if let Some(st) = app.session.documents().iter().find(|st| st.doc.id == doc)
++        && live.src.as_ref().is_some_and(|src| !src.reads(st))
++    {
++        match QuickSource::on(&app.session, doc, &live.settings) {
++            Ok(src) => live.start(src),
++            Err(e) => {
++                live.failed = true;
++                app.ui.status = e.to_string();
+                 app.ui.status_error = true;
+-                return false;
++                return !live.released;
+             }
+         }
+-        // Its document isn't the active one: a released stroke can't be committed there.
+-        _ if front.released => {
+-            app.ui.status = tl!("The Quick Selection stroke was dropped: its document is no longer the active one").into();
+-            app.ui.status_error = true;
+-            drop_front(app);
+-            return true;
+-        }
+-        _ => return false,
+     }
+-    let view = view.filter(|v| v.doc == front.doc);
+-    // The desktop sends every closed segment to the worker at once; it grows them in order.
++    let view = view.filter(|v| v.doc == doc);
++    // The desktop sends every closed segment to the worker at once.
+     #[cfg(not(target_arch = "wasm32"))]
+-    let inline = inline || !front.send(view);
++    let inline = inline || !live.send(view);
+     let _ = view;
+-    if inline {
++    if inline && let Some(src) = live.src.clone() {
+         loop {
+-            if cfg!(target_arch = "wasm32") && !front.throttle.ready(now) {
++            if cfg!(target_arch = "wasm32") && !live.released && !live.throttle.ready(now) {
+                 break;
+             }
+-            let Some((pts, mode)) = front.next() else { break };
++            let Some((pts, mode)) = live.next() else { break };
+             #[cfg(test)]
+             if app.background_jobs {
+                 app.quick.inline_grows += 1;
+             }
+-            front.grow_inline(&pts, mode);
++            live.grow_inline(&src, &pts, mode);
+             if cfg!(target_arch = "wasm32") {
+-                front.throttle.grew(now);
+-                break;
++                live.throttle.grew(now);
++                if !live.released {
++                    break;
++                }
+             }
+         }
+     }
+-    if front.released && front.caught_up() {
+-        commit_front(app);
+-        return true;
++    if live.released {
++        return commit(app, i);
+     }
+-    false
++    true
+ }
+ 
+-/// Drop the oldest stroke uncommitted (it failed, or its document went), running the commands
+-/// that waited for it.
+-fn drop_front(app: &mut PhotocraftApp) {
+-    if app.quick.strokes.is_empty() {
+-        return;
++/// Run `f` with document `doc` active (the active document back afterwards): a stroke commits on
++/// the document it was drawn on, whichever tab is in front. `None` when it is closed.
++fn on_document<R>(app: &mut PhotocraftApp, doc: DocId, f: impl FnOnce(&mut PhotocraftApp) -> R) -> Option<R> {
++    let index = app.session.documents().iter().position(|st| st.doc.id == doc)?;
++    let front = app.session.active().map(|st| st.doc.id);
++    let switch = app.session.active_index() != Some(index);
++    if switch {
++        app.session.set_active(index);
++    }
++    let r = f(app);
++    if switch && let Some(i) = front.and_then(|id| app.session.documents().iter().position(|st| st.doc.id == id)) {
++        app.session.set_active(i);
+     }
+-    let live = app.quick.strokes.remove(0);
+-    run_after(app, live.after);
++    Some(r)
+ }
+ 
+-/// Commit the oldest stroke as one `select.quick`, taking its live result, then run the commands
+-/// that waited for it.
+-fn commit_front(app: &mut PhotocraftApp) {
+-    if app.quick.strokes.is_empty() {
+-        return;
++/// Commit released stroke `i` as one `select.quick` on its document, taking the live stroke.
++/// True while its job runs (the stroke stays, for the canvas), false once done with.
++fn commit(app: &mut PhotocraftApp, i: usize) -> bool {
++    let Some(live) = app.quick.strokes.get_mut(i) else { return false };
++    if live.cutter.closed().is_empty() {
++        return false;
+     }
+-    let live = app.quick.strokes.remove(0);
+-    if !live.shown.segments().is_empty() {
+-        let mut p = live.settings.clone();
+-        if let (Some(o), Value::Object(s)) = (p.as_object_mut(), live.shown.params()) {
+-            o.extend(s);
+-        }
+-        app.session.offer_live_quick(QuickCommit::new(live.src, live.shown));
+-        app.quick.committing = true;
++    let doc = live.doc;
++    let mut p = live.settings.clone();
++    if let (Some(o), Value::Object(s)) = (p.as_object_mut(), quick_stroke::params_of(&live.points, live.cutter.closed())) {
++        o.extend(s);
++    }
++    let Some((offer, handed)) = live.offer() else { return false };
++    let r = on_document(app, doc, |app| {
++        app.session.offer_live_quick(offer);
+         let r = app.run("select.quick", p);
+-        app.quick.committing = false;
+         // An offer the command didn't take (it was refused) must not linger.
+         app.session.clear_live_stroke();
+-        #[cfg(test)]
+-        {
+-            app.quick.last_commit = Some(r.clone());
+-        }
+-        committed(app, r);
++        r
++    })
++    .unwrap_or_else(|| Err(tl!("The document was closed").to_string()));
++    let job = r.as_ref().ok().filter(|v| v.get("pending").and_then(Value::as_bool) == Some(true)).and_then(|v| v.get("job")).and_then(Value::as_u64);
++    if let (Some(job), Some(live)) = (job, app.quick.strokes.get_mut(i)) {
++        live.job = Some((JobId(job), handed.unwrap_or_default()));
++        return true;
+     }
+-    run_after(app, live.after);
++    committed(app, r);
++    false
+ }
+ 
+-/// Run commands that waited for a stroke, in order, before any later stroke.
+-fn run_after(app: &mut PhotocraftApp, after: Vec<(String, Value)>) {
+-    if after.is_empty() {
+-        return;
+-    }
+-    app.quick.committing = true;
+-    for (id, p) in after {
+-        if let Err(e) = app.run(&id, p) {
+-            app.ui.status = e;
+-            app.ui.status_error = true;
++/// A job ended (see [`crate::jobs_ui`]): when it committed a stroke, report it like a commit and
++/// let the strokes waiting for it go. True when it was one (nothing else to report).
++pub(crate) fn on_job_event(app: &mut PhotocraftApp, e: &JobEvent) -> bool {
++    let Some(i) = app.quick.strokes.iter().position(|l| l.job.as_ref().is_some_and(|(job, _)| *job == e.id)) else { return false };
++    let live = app.quick.strokes.remove(i);
++    let handled = match &e.outcome {
++        JobOutcome::Done(v) => {
++            // The last outline, traced on the worker, is the committed selection's.
++            if let Some(p) = live.job.as_ref().and_then(|(_, h)| h.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take())
++                && let Some(o) = p.outline
++            {
++                app.outline_cache = Some(o);
++            }
++            app.sync_views();
++            committed(app, Ok(v.clone()));
++            true
+         }
+-    }
+-    app.quick.committing = false;
++        // Failed or cancelled: reported like any job.
++        JobOutcome::Failed(err) => {
++            #[cfg(test)]
++            {
++                app.quick.last_commit = Some(Err(err.clone()));
++            }
++            let _ = err;
++            false
++        }
++        JobOutcome::Cancelled => false,
++    };
++    pump(app);
++    handled
+ }
+ 
+ /// The button went up on the stroke `d`: its last points become the final segment, committed
+-/// once grown, and New switches to Add, as in Photoshop. False when the stroke has no live state
+-/// (the caller selects it at once).
++/// on its document, and New switches to Add, as in Photoshop. False when the stroke has no live
++/// state (the caller selects it at once).
+ pub(crate) fn release(app: &mut PhotocraftApp, d: &crate::canvas::Drag) -> bool {
+     let bar = app.ui.quick_selection_mode;
+     let Some(live) = app.quick.strokes.last_mut().filter(|l| !l.released) else { return false };
+@@ -637,19 +667,12 @@ pub(crate) fn release(app: &mut PhotocraftApp, d: &crate::canvas::Drag) -> bool
+     true
+ }
+ 
+-/// A command `id` coming while a released stroke still grows: one that edits the document is
+-/// kept to run after that stroke's commit, in order (`Some`, a pending result); view, tool and
+-/// other document-independent commands run at once (`None`), as does everything else.
+-pub(crate) fn defer(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
+-    if app.quick.committing || photocraft_engine::jobs::independent_of_document(id) {
+-        return None;
+-    }
+-    let live = app.quick.strokes.iter_mut().rev().find(|l| l.released)?;
+-    live.after.push((id.to_string(), params.clone()));
+-    Some(Ok(json!({"pending": true, "after": "select.quick"})))
++/// Whether job `job` is a stroke's commit.
++pub(crate) fn commits(app: &PhotocraftApp, job: JobId) -> bool {
++    app.quick.strokes.iter().any(|l| l.job.as_ref().is_some_and(|(j, _)| *j == job))
+ }
+ 
+-/// A released stroke is still growing (its commit is to come).
++/// A released stroke has yet to be committed.
+ pub fn finishing(app: &PhotocraftApp) -> bool {
+     app.quick.strokes.iter().any(|l| l.released)
+ }
+@@ -679,20 +702,28 @@ pub(crate) fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
+ }
+ 
+ /// After a Quick Selection stroke's `select.quick`: New switches to Add once a stroke has
+-/// selected something, as in Photoshop; a stroke that found nothing says so.
++/// selected something, as in Photoshop; a stroke that found nothing says so, an error says why.
+ pub(crate) fn committed(app: &mut PhotocraftApp, r: Result<Value, String>) {
++    #[cfg(test)]
++    {
++        app.quick.last_commit = Some(r.clone());
++    }
+     if r.as_ref().is_ok_and(|v| v.get("changed").and_then(Value::as_bool) != Some(false)) && app.ui.quick_selection_mode == NEW {
+         app.ui.quick_selection_mode = ADD;
+     }
++    if let Err(e) = &r {
++        app.ui.status = e.clone();
++        app.ui.status_error = true;
++    }
+     crate::retouch_ui::report_smart_result(app, r, tl!("Quick Selection found nothing there"));
+ }
+ 
+ /// The selection the canvas outlines on document `doc` while a stroke there has grown, shared
+-/// (no copy), with its content bounds: the newest stroke that has grown on its current base
+-/// (`None`: the document's; `Some((None, _))`: nothing selected so far).
++/// (the surface isn't copied), with its content bounds: the newest stroke that has grown on its
++/// current base (`None`: the document's; `Some((None, _))`: nothing selected so far).
+ pub(crate) fn shown(app: &PhotocraftApp, doc: DocId) -> Option<(Option<Arc<Surface>>, Rect)> {
+     let live = app.quick.strokes.iter().rev().filter(|l| l.doc == doc && !l.failed).find(|l| l.grown > 0)?;
+-    Some((live.shown_sel.clone(), live.shown_bounds))
++    Some((live.preview.sel.clone(), live.preview.bounds))
+ }
+ 
+ /// Whether the stroke being dragged has grown on its base (until then the canvas draws the
+@@ -706,21 +737,27 @@ pub fn idle(app: &PhotocraftApp) -> bool {
+     app.quick.strokes.is_empty()
+ }
+ 
+-/// Wait for the segments growing now and those they let start, until nothing grows (tests and
+-/// the bench drive the threaded path step by step).
++/// Wait for what is growing and the commits it leads to, until nothing is left (tests and the
++/// bench drive the threaded path step by step).
+ #[cfg(not(target_arch = "wasm32"))]
+ pub fn settle(app: &mut PhotocraftApp) {
++    let ctx = egui::Context::default();
+     for _ in 0..100_000 {
+         pump(app);
+-        let Some(front) = app.quick.strokes.first_mut() else { return };
+-        if !front.busy() {
+-            return;
++        let Some(i) = app.quick.strokes.iter().position(|l| l.busy() || l.job.is_some()) else { return };
++        let job = app.quick.strokes.get(i).and_then(|l| l.job.as_ref().map(|(job, _)| *job));
++        if let Some(job) = job {
++            // Applied here; its event reaches the shell (and this module) through the next poll.
++            let _ = app.session.wait_job(job);
++            crate::jobs_ui::tick(app, &ctx);
++            continue;
+         }
+-        match front.collect(true) {
++        let Some(live) = app.quick.strokes.get_mut(i) else { return };
++        match live.collect(true) {
+             Ok(Some(outline)) => app.outline_cache = Some(outline),
+             Ok(None) => {}
+             Err(e) => {
+-                front.failed = true;
++                live.failed = true;
+                 app.ui.status = e;
+                 app.ui.status_error = true;
+             }
+@@ -732,7 +769,7 @@ pub fn settle(app: &mut PhotocraftApp) {
+ /// bench and tests).
+ pub fn progress(app: &PhotocraftApp) -> Option<(usize, bool)> {
+     let last = app.quick.strokes.last()?;
+-    Some((last.updates, app.quick.strokes.iter().any(QuickLive::busy)))
++    Some((last.updates, app.quick.strokes.iter().any(|l| l.busy() || l.job.is_some())))
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/ui-egui/src/quick_select_ui/worker.rs b/crates/ui-egui/src/quick_select_ui/worker.rs
+new file mode 100644
+index 00000000..4b8d5692
+--- /dev/null
++++ b/crates/ui-egui/src/quick_select_ui/worker.rs
+@@ -0,0 +1,373 @@
++//! A Quick Selection stroke's worker thread (desktop): it plans the segments sent to it in order,
++//! grows their regions at once on the Quick Selection thread pool, combines them in order as they
++//! come back (so the result is the one growing them one after another makes), traces the new
++//! outline, and hands the stroke back after each change. A base it has left (the document
++//! changed under the stroke) is dropped at once: regions still queued for it are skipped.
++
++use std::collections::BTreeMap;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
++use std::time::Duration;
++
++use photocraft_algo::segment::quick::SPECULATE_DEFAULT;
++use photocraft_algo::selection::{Region, SelectionMode};
++use photocraft_engine::EngineError;
++use photocraft_engine::quick_stroke::{Finish, QuickSource, QuickStroke};
++
++use super::{Handed, OutlineView, Preview, bounds, failed_message, pool};
++
++/// Work for a stroke's worker.
++pub(crate) enum Task {
++    /// Start (again) from `stroke` on `src`: the stroke began, or was rebased. With
++    /// `keep_regions` the pixels are the ones the regions grown so far were grown on.
++    Reset { generation: u64, src: QuickSource, stroke: QuickStroke, keep_regions: bool },
++    /// Grow the next segment, and trace the outline for `view`.
++    Grow { generation: u64, pts: Vec<(f32, f32)>, mode: SelectionMode, view: Option<OutlineView> },
++}
++
++/// What a worker hands back.
++pub(crate) enum Back {
++    /// The stroke after a change, combined on base `generation`, and its preview.
++    Grown { generation: u64, stroke: Box<QuickStroke>, preview: Preview },
++    /// Growing on base `generation` failed (an internal error): it grows nothing more of it.
++    Failed { generation: u64 },
++}
++
++/// Most regions kept for a rebase that leaves the pixels alone (a long stroke's first ones).
++const CACHED: usize = 1024;
++
++/// What the worker thread receives: tasks from the stroke, regions from the pool, or the end.
++enum Msg {
++    Task(Task),
++    /// Segment `index`'s region grown from `line` on pixels `pixels` (`None`: skipped, not wanted
++    /// any more when its turn came).
++    Region {
++        pixels: u64,
++        index: usize,
++        line: Vec<(f32, f32)>,
++        region: Option<std::thread::Result<Option<Region>>>,
++    },
++    Stop,
++}
++
++/// Test hooks a worker honours: a lock each region takes before growing, failing, and a count of
++/// the regions it grew.
++#[cfg(test)]
++pub(crate) type Hooks = (Option<Arc<std::sync::RwLock<()>>>, bool, Arc<std::sync::atomic::AtomicUsize>);
++
++/// A stroke's worker thread. Dropping it stops the thread and skips the regions still queued.
++pub(crate) struct Worker {
++    tx: Sender<Msg>,
++    rx: Receiver<Back>,
++    /// The pixels the stroke reads (bumped by every rebase that changed them): a region queued
++    /// for others is skipped.
++    current: Arc<AtomicU64>,
++    /// The stroke is gone (or its commit was cancelled): skip everything queued.
++    stop: Arc<AtomicBool>,
++    /// The thread is running.
++    alive: Arc<AtomicBool>,
++}
++
++/// Marks the worker thread as ended however it ends.
++struct Alive(Arc<AtomicBool>);
++
++impl Drop for Alive {
++    fn drop(&mut self) {
++        self.0.store(false, Ordering::Relaxed);
++    }
++}
++
++impl Drop for Worker {
++    fn drop(&mut self) {
++        self.stop.store(true, Ordering::Relaxed);
++        let _ = self.tx.send(Msg::Stop);
++    }
++}
++
++impl Worker {
++    /// Start a worker; `None` when no thread can be had (the segments then grow inline).
++    pub(crate) fn start(ctx: Option<egui::Context>, #[cfg(test)] hooks: Hooks) -> Option<Self> {
++        let (tx, msgs) = channel::<Msg>();
++        let (done, rx) = channel::<Back>();
++        let current = Arc::new(AtomicU64::new(0));
++        let stop = Arc::new(AtomicBool::new(false));
++        let alive = Arc::new(AtomicBool::new(true));
++        let thread = Thread {
++            regions: tx.clone(),
++            done,
++            current: Arc::clone(&current),
++            stop: Arc::clone(&stop),
++            ctx,
++            #[cfg(test)]
++            hooks,
++            state: None,
++            pixels: 0,
++            cache: BTreeMap::new(),
++            growing: BTreeMap::new(),
++        };
++        let marker = Alive(Arc::clone(&alive));
++        std::thread::Builder::new()
++            .name("quick-selection".into())
++            .spawn(move || {
++                let _alive = marker;
++                thread.run(&msgs);
++            })
++            .ok()?;
++        Some(Self { tx, rx, current, stop, alive })
++    }
++
++    /// A worker with no thread, and the sender of what it hands back (tests).
++    #[cfg(test)]
++    pub(crate) fn detached() -> (Self, Sender<Back>) {
++        let (tx, _msgs) = channel::<Msg>();
++        let (done, rx) = channel::<Back>();
++        let flag = || Arc::new(AtomicBool::new(false));
++        (Self { tx, rx, current: Arc::new(AtomicU64::new(0)), stop: flag(), alive: Arc::new(AtomicBool::new(true)) }, done)
++    }
++
++    /// Send `task`; false when the thread is gone.
++    pub(crate) fn send(&self, task: Task) -> bool {
++        if let Task::Reset { keep_regions: false, .. } = &task {
++            // New pixels (the thread counts them the same way): regions still queued for the
++            // old ones are skipped from now on, before the thread reads this.
++            self.current.fetch_add(1, Ordering::Relaxed);
++        }
++        self.tx.send(Msg::Task(task)).is_ok()
++    }
++
++    /// The next thing handed back, waiting for it; `None` when the thread is gone.
++    pub(crate) fn recv(&self) -> Option<Back> {
++        self.rx.recv().ok()
++    }
++
++    /// The next thing handed back, if any.
++    pub(crate) fn try_recv(&self) -> Option<Back> {
++        self.rx.try_recv().ok()
++    }
++
++    /// The thread has ended (it failed, or was stopped).
++    pub(crate) fn gone(&self) -> bool {
++        !self.alive.load(Ordering::Relaxed)
++    }
++
++    /// How `select.quick` gets the stroke once the worker has combined all `total` segments on
++    /// base `generation` (everything it hands back meanwhile goes to `handed`, for the canvas).
++    /// Cancelling the job stops the worker.
++    pub(crate) fn finish(self, generation: u64, total: usize, handed: Handed) -> Finish {
++        Box::new(move |ctx| {
++            loop {
++                if ctx.cancelled() {
++                    return Err(EngineError::Cancelled);
++                }
++                match self.rx.recv_timeout(Duration::from_millis(10)) {
++                    Ok(Back::Grown { generation: g, stroke, preview }) if g == generation => {
++                        ctx.progress(stroke.combined() as f32 / total.max(1) as f32, "Selecting");
++                        let whole = stroke.combined() >= total;
++                        *handed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(preview);
++                        if whole {
++                            return Ok(*stroke);
++                        }
++                    }
++                    Ok(Back::Failed { generation: g }) if g == generation => return Err(EngineError::Other(failed_message())),
++                    Ok(_) | Err(RecvTimeoutError::Timeout) => {}
++                    Err(RecvTimeoutError::Disconnected) => return Err(EngineError::Other(failed_message())),
++                }
++            }
++        })
++    }
++}
++
++/// A region grown from a polyline (`None`: it found nothing).
++type Grown = (Vec<(f32, f32)>, Option<Region>);
++
++/// A base's segments on the worker thread.
++struct Base {
++    generation: u64,
++    src: Arc<QuickSource>,
++    stroke: QuickStroke,
++    /// Each planned segment's polyline and mode, by index (combined in this order).
++    planned: Vec<(Vec<(f32, f32)>, SelectionMode)>,
++    /// Regions grown and not combined yet, by index.
++    arrived: BTreeMap<usize, Option<Region>>,
++    view: Option<OutlineView>,
++}
++
++/// The worker thread's state.
++struct Thread {
++    /// Where pool tasks send the regions they grew.
++    regions: Sender<Msg>,
++    done: Sender<Back>,
++    /// The pixels the stroke reads, as the stroke last set them (see [`Thread::pixels`]).
++    current: Arc<AtomicU64>,
++    stop: Arc<AtomicBool>,
++    ctx: Option<egui::Context>,
++    #[cfg(test)]
++    hooks: Hooks,
++    state: Option<Base>,
++    /// The pixels the stroke reads: bumped by a rebase that changed them. A region grown on them
++    /// is the segment's on any base with these pixels (an edit of the selection only rebases).
++    pixels: u64,
++    /// Regions grown on these pixels, by segment index with the line they grew from.
++    cache: BTreeMap<usize, Grown>,
++    /// Regions growing on these pixels, by segment index with their line.
++    growing: BTreeMap<usize, Vec<(f32, f32)>>,
++}
++
++impl Thread {
++    fn run(mut self, msgs: &Receiver<Msg>) {
++        while let Ok(first) = msgs.recv() {
++            let mut next = Some(first);
++            let mut failed = false;
++            while let Some(msg) = next.take() {
++                match msg {
++                    Msg::Stop => return,
++                    Msg::Task(task) => self.task(task),
++                    Msg::Region { pixels, index, line, region } => failed |= self.arrived(pixels, index, line, region),
++                }
++                // Everything that has come, before combining.
++                next = match msgs.try_recv() {
++                    Ok(m) => Some(m),
++                    Err(TryRecvError::Empty) => None,
++                    Err(TryRecvError::Disconnected) => return,
++                };
++            }
++            if self.stop.load(Ordering::Relaxed) {
++                return;
++            }
++            if !failed {
++                failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.combine())).is_err();
++            }
++            if failed {
++                let generation = self.state.take().map_or(0, |b| b.generation);
++                self.cache.clear();
++                self.growing.clear();
++                if self.done.send(Back::Failed { generation }).is_err() {
++                    return;
++                }
++                self.wake();
++            }
++        }
++    }
++
++    fn wake(&self) {
++        if let Some(ctx) = &self.ctx {
++            ctx.request_repaint();
++        }
++    }
++
++    /// A region came back. True when growing it failed for the current base.
++    fn arrived(&mut self, pixels: u64, index: usize, line: Vec<(f32, f32)>, region: Option<std::thread::Result<Option<Region>>>) -> bool {
++        // Grown on pixels the stroke no longer reads: nothing to do with it.
++        if pixels != self.pixels {
++            return false;
++        }
++        if self.growing.get(&index) == Some(&line) {
++            self.growing.remove(&index);
++        }
++        let wanted = self.state.as_ref().is_some_and(|b| index >= b.stroke.combined() && b.planned.get(index).is_some_and(|(l, _)| *l == line));
++        match region {
++            // Skipped (the worker is stopping): nothing grown.
++            None => false,
++            Some(Ok(region)) => {
++                if self.cache.len() < CACHED || self.cache.contains_key(&index) {
++                    self.cache.insert(index, (line, region.clone()));
++                }
++                if let Some(base) = self.state.as_mut().filter(|_| wanted) {
++                    base.arrived.insert(index, region);
++                }
++                false
++            }
++            Some(Err(_)) => wanted,
++        }
++    }
++
++    fn task(&mut self, task: Task) {
++        match task {
++            Task::Reset { generation, src, stroke, keep_regions } => {
++                if !keep_regions {
++                    self.cache.clear();
++                    self.growing.clear();
++                    self.pixels += 1;
++                }
++                self.state = Some(Base { generation, src: Arc::new(src), stroke, planned: Vec::new(), arrived: BTreeMap::new(), view: None });
++            }
++            Task::Grow { generation, pts, mode, view } => {
++                let Some(base) = self.state.as_mut().filter(|b| b.generation == generation) else { return };
++                base.view = view;
++                let index = base.planned.len();
++                let Some(planned) = base.stroke.plan(&base.src, &pts, mode) else { return };
++                base.planned.push((planned.line.clone(), planned.mode));
++                // Grown already on these pixels from this very line (a rebase kept them), or
++                // growing: it is the segment's region here too.
++                if let Some((line, region)) = self.cache.get(&index)
++                    && *line == planned.line
++                {
++                    base.arrived.insert(index, region.clone());
++                    return;
++                }
++                if self.growing.get(&index) == Some(&planned.line) {
++                    return;
++                }
++                // Alone, a segment cuts a few window sizes at once to be back sooner; behind
++                // others, one at a time, so no thread cuts windows that turn out unneeded.
++                let waiting = index.saturating_sub(base.stroke.combined());
++                let speculate = if waiting == 0 { SPECULATE_DEFAULT } else { 1 };
++                self.growing.insert(index, planned.line.clone());
++                let (src, tx, current, stop, pixels) =
++                    (Arc::clone(&base.src), self.regions.clone(), Arc::clone(&self.current), Arc::clone(&self.stop), self.pixels);
++                #[cfg(test)]
++                let hooks = self.hooks.clone();
++                let grow = move || {
++                    #[cfg(test)]
++                    let _held = hooks.0.as_ref().map(|g| g.read().unwrap_or_else(std::sync::PoisonError::into_inner));
++                    let line = planned.line;
++                    // The stroke went, or its pixels changed: not wanted any more.
++                    let region = if stop.load(Ordering::Relaxed) || current.load(Ordering::Relaxed) != pixels {
++                        None
++                    } else {
++                        Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                            #[cfg(test)]
++                            {
++                                if hooks.1 {
++                                    std::panic::resume_unwind(Box::new("a failing worker (test)"));
++                                }
++                                hooks.2.fetch_add(1, Ordering::Relaxed);
++                            }
++                            src.region_speculating(&line, speculate)
++                        })))
++                    };
++                    let _ = tx.send(Msg::Region { pixels, index, line, region });
++                };
++                match pool() {
++                    Some(pool) => pool.spawn(grow),
++                    None => grow(),
++                }
++            }
++        }
++    }
++
++    /// Combine the regions that have come, in order; when that changed the stroke, trace its
++    /// outline and hand it back.
++    fn combine(&mut self) {
++        let Some(base) = self.state.as_mut() else { return };
++        let before = base.stroke.combined();
++        while let Some(region) = base.arrived.remove(&base.stroke.combined()) {
++            let mode = base.planned.get(base.stroke.combined()).map_or(SelectionMode::Add, |p| p.1);
++            base.stroke.apply(mode, region);
++        }
++        if base.stroke.combined() == before {
++            return;
++        }
++        // Traced here, on one thread: the pool is busy growing, and the UI's is the UI's.
++        let bounds = bounds(&base.stroke);
++        let outline = base.view.zip(base.stroke.selection()).map(|(v, sel)| {
++            let segs = crate::outline::outline_scaled_serial(sel, bounds.intersect(&v.vis), v.step);
++            (v.doc, crate::canvas::outline_key(sel, v.step, v.doc, v.vis, 1), Arc::new(segs))
++        });
++        let sel = base.stroke.selection().cloned().map(Arc::new);
++        let back = Back::Grown { generation: base.generation, stroke: Box::new(base.stroke.clone()), preview: Preview { sel, bounds, outline } };
++        let _ = self.done.send(back);
++        self.wake();
++    }
++}
+diff --git a/crates/ui-egui/src/quick_select_ui_tests.rs b/crates/ui-egui/src/quick_select_ui_tests.rs
+index 870cc1c5..f3febb34 100644
+--- a/crates/ui-egui/src/quick_select_ui_tests.rs
++++ b/crates/ui-egui/src/quick_select_ui_tests.rs
+@@ -211,44 +211,159 @@ fn alt_subtracts_pressed_before_or_during_the_drag_and_shift_adds() {
+     assert!(doc_selection(&app).is_some_and(|s| s.sample_channel(1320, 40, 0) >= 0.5 && s.sample_channel(80, 300, 0) >= 0.5));
+ }
+ 
++/// A stroke on the red part released while its worker is held on `gate` (the caller holds the
++/// write lock): it is being committed by its job.
++fn released_stroke_held(app: &mut PhotocraftApp, gate: &Arc<std::sync::RwLock<()>>) -> photocraft_engine::jobs::JobId {
++    app.background_jobs = true;
++    app.quick.gate = Some(gate.clone());
++    down(app, 100.0, 300.0, Modifiers::NONE);
++    for k in 1..=4 {
++        drag(app, 100.0 + 40.0 * f64::from(k), 300.0, Modifiers::NONE);
++    }
++    up(app, 260.0, 300.0, Modifiers::NONE);
++    assert!(finishing(app));
++    let doc = app.session.active().unwrap().doc.id;
++    let job = app.session.job_on(doc).expect("the stroke is committed by a job on its document");
++    assert_eq!(job.label, "Quick Selection");
++    assert_eq!(job.command, "select.quick");
++    job.id
++}
++
+ #[test]
+-fn nothing_waits_for_a_stroke_still_growing_after_its_release() {
+-    // Review of #9145: a new press and every command waited for the released stroke, growing its
+-    // last segments on the UI thread (96 ms for a 30 px brush on 24 MP, 335 ms for 100 px). Now
+-    // the workers are held until the end: if anything waited for them, this test would hang.
++fn a_released_stroke_commits_as_a_job_and_edits_of_its_document_wait() {
++    // Review of #9145: commands that came after a release were queued behind the stroke and run
++    // later, on whatever document was active then: the stroke could be lost and a Select All meant
++    // for its document land on another. The stroke is now a job on its document, like any.
+     let mut app = quick_app();
+-    app.background_jobs = true;
++    let doc_a = app.session.active().unwrap().doc.id;
+     let gate = Arc::new(std::sync::RwLock::new(()));
+-    app.quick.gate = Some(gate.clone());
+     let held = gate.write().unwrap();
+-    down(&mut app, 100.0, 300.0, Modifiers::NONE);
+-    for k in 1..=4 {
+-        drag(&mut app, 100.0 + 40.0 * f64::from(k), 300.0, Modifiers::NONE);
++    released_stroke_held(&mut app, &gate);
++    // Tools and views aren't held up.
++    app.run("tools.setBrush", json!({"size": 24})).unwrap();
++    app.run("view.zoomIn", json!({})).unwrap();
++    // An edit of its document is refused, with the job's name, and nothing is queued.
++    for (id, p) in [("select.all", json!({})), ("layer.new.layer", json!({})), ("view.newGuide", json!({"orientation": "vertical", "position": 40}))] {
++        let err = app.run(id, p).unwrap_err();
++        assert!(err.contains("Quick Selection") && err.contains("still running"), "{id}: {err}");
+     }
+-    up(&mut app, 260.0, 300.0, Modifiers::NONE);
+-    assert!(finishing(&app));
+-    // A view or tool command runs at once.
+-    let r = app.run("tools.setBrush", json!({"brush": {"size": 24}})).unwrap();
+-    assert_eq!(r.get("pending"), None, "{r}");
+-    // A command that edits the document waits for the stroke, in order.
+-    let r = app.run("select.inverse", json!({})).unwrap();
+-    assert_eq!(r["pending"], true);
+-    assert!(app.session.journal.iter().all(|(id, _)| id != "select.quick" && id != "select.inverse"));
+-    // The next press queues behind the stroke, and is drawn meanwhile.
++    // A new stroke pressed on it follows the first one: drawn now, started from its result.
+     down(&mut app, 100.0, 450.0, Modifiers::NONE);
+     drag(&mut app, 160.0, 450.0, Modifiers::NONE);
+     up(&mut app, 200.0, 450.0, Modifiers::NONE);
++    // Another document is free: a new one, selected at once, becomes the active one.
++    app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
++    let doc_b = app.session.active().unwrap().doc.id;
++    app.run("select.all", json!({})).unwrap();
+     drop(held);
+     settle(&mut app);
+     assert!(idle(&app));
+-    let ids: Vec<&str> = app.session.journal.iter().map(|(id, _)| id.as_str()).filter(|id| id.starts_with("select.")).collect();
+-    assert_eq!(ids, ["select.quick", "select.inverse", "select.quick"], "in the order they came");
+-    let sel = doc_selection(&app);
+-    // The first stroke, inverted, then the second added on top (New switched to Add on release).
+-    assert!(sel.as_ref().is_some_and(|s| s.sample_channel(180, 300, 0) < 0.5 && s.sample_channel(10, 10, 0) >= 0.5 && s.sample_channel(180, 450, 0) >= 0.5));
++    let ids: Vec<&str> = app.session.journal.iter().map(|(id, _)| id.as_str()).filter(|id| id.starts_with("select.") || id.starts_with("view.new")).collect();
++    assert_eq!(ids, ["select.all", "select.quick", "select.quick"], "B's Select All, then both strokes on A");
++    assert_eq!(app.session.active().unwrap().doc.id, doc_b, "the active document stays B");
++    let a = app.session.documents().iter().find(|st| st.doc.id == doc_a).unwrap();
++    let sel = a.doc.selection.as_ref();
++    assert!(sel.is_some_and(|s| s.sample_channel(180, 300, 0) >= 0.5 && s.sample_channel(180, 450, 0) >= 0.5), "both strokes landed on A");
++    assert!(sel.is_some_and(|s| s.sample_channel(10, 10, 0) < 0.5), "A got no Select All");
++    assert_eq!(a.history.undo_label(), Some("Quick Selection"));
++    assert!(a.doc.guides.vertical.is_empty(), "the refused guide was never added");
++    assert!(app.session.active().unwrap().doc.selection.as_ref().is_some_and(|s| s.sample_channel(150, 100, 0) >= 0.5), "B has its Select All");
+     assert_eq!(app.quick.inline_grows, 0, "nothing grew on the UI thread");
+ }
+ 
++#[test]
++fn control_requests_while_a_stroke_commits_get_real_replies_through_the_gate() {
++    // Review of #9145: a command deferred behind a stroke replied `{"pending": true}` (even
++    // `engine.commands`), lost its errors and later ran without the automation gate.
++    fn deny_new_layer(id: &str, _: &Value) -> photocraft_engine::Result<()> {
++        if id == "layer.new.layer" { Err(photocraft_engine::EngineError::Other("layer.new.layer is denied (test)".into())) } else { Ok(()) }
++    }
++    let services = crate::Services {
++        automation_command: Some(Box::new(|id, _| if id == "layer.new.layer" { Err("layer.new.layer is denied (test)".into()) } else { Ok(()) })),
++        automation_authorize: Some(deny_new_layer),
++        ..Default::default()
++    };
++    let mut app = quick_app();
++    app.services = services;
++    app.session.actions.list.push(photocraft_engine::actions_cmds::Action {
++        name: "Add".into(),
++        steps: vec![("layer.new.layer".into(), json!({}))],
++        ..Default::default()
++    });
++    let ctx = egui::Context::default();
++    let call = |app: &mut PhotocraftApp, method: &str, params: Value| -> Value {
++        let (req, _rx) = crate::control::ControlRequest::new(method, params);
++        match crate::control::handle(app, &ctx, &req) {
++            crate::control::Outcome::Done(v) => v,
++            _ => panic!("{method}: expected an immediate reply"),
++        }
++    };
++    let layers = |app: &PhotocraftApp| app.session.active().unwrap().doc.layers.len();
++    let n0 = layers(&app);
++    let gate = Arc::new(std::sync::RwLock::new(()));
++    let held = gate.write().unwrap();
++    released_stroke_held(&mut app, &gate);
++    let play = call(&mut app, "engine.execute", json!({"command": "actions.play", "params": {"action": "Add"}}));
++    let bad = call(&mut app, "engine.execute", json!({"command": "select.quick", "params": {"points": []}}));
++    let list = call(&mut app, "engine.commands", json!({}));
++    let all = call(&mut app, "engine.execute", json!({"command": "select.all", "params": {}}));
++    for (what, r) in [("bad params", &bad), ("select.all", &all)] {
++        assert_eq!(r["ok"], false, "{what}: {r}");
++    }
++    // The play ran nothing: its step was refused by the gate, and says so.
++    assert_eq!(play["result"]["ran"], 0, "{play}");
++    assert!(play["result"]["failed"]["error"].as_str().is_some_and(|e| e.contains("denied")), "{play}");
++    for r in [&play, &bad, &list, &all] {
++        assert!(r.get("result").and_then(|v| v.get("pending")).is_none(), "{r}");
++    }
++    assert!(all["error"].as_str().is_some_and(|e| e.contains("still running")), "{all}");
++    assert!(list["result"].is_array(), "engine.commands lists the commands: {list}");
++    drop(held);
++    settle(&mut app);
++    assert!(idle(&app));
++    assert_eq!(layers(&app), n0, "the denied step never ran, then or later");
++    assert!(doc_selection(&app).is_some_and(|s| s.sample_channel(180, 300, 0) >= 0.5), "the stroke is committed");
++}
++
++#[test]
++fn cancelling_a_released_stroke_leaves_the_document_alone() {
++    let mut app = quick_app();
++    let gate = Arc::new(std::sync::RwLock::new(()));
++    let held = gate.write().unwrap();
++    let steps = app.session.active().unwrap().history.past_len();
++    let job = released_stroke_held(&mut app, &gate);
++    // What Esc (or the status bar's ×) does for the job in view.
++    assert_eq!(crate::jobs_ui::job_in_view(&app).map(|j| j.id), Some(job));
++    assert!(crate::jobs_ui::cancel(&mut app, job));
++    drop(held);
++    settle(&mut app);
++    crate::jobs_ui::tick(&mut app, &egui::Context::default());
++    assert!(idle(&app));
++    assert_eq!(doc_selection(&app), None);
++    assert_eq!(app.session.active().unwrap().history.past_len(), steps);
++    assert!(app.session.journal.iter().all(|(id, _)| id != "select.quick"));
++    assert!(app.ui.status.contains("Cancelled"), "{}", app.ui.status);
++    assert!(app.run("select.all", json!({})).is_ok(), "the document is free again");
++}
++
++#[test]
++fn a_stroke_released_on_another_tab_commits_on_its_own_document() {
++    let mut app = quick_app();
++    let doc_a = app.session.active().unwrap().doc.id;
++    app.session.execute("file.new", json!({"width": 300, "height": 200})).unwrap();
++    app.session.set_active(0);
++    down(&mut app, 100.0, 300.0, Modifiers::NONE);
++    drag(&mut app, 160.0, 300.0, Modifiers::NONE);
++    // The other tab comes to the front before the button goes up.
++    app.session.set_active(1);
++    up(&mut app, 200.0, 300.0, Modifiers::NONE);
++    assert!(idle(&app));
++    assert_eq!(app.session.active_index(), Some(1));
++    assert!(app.session.active().unwrap().doc.selection.is_none());
++    let a = app.session.documents().iter().find(|st| st.doc.id == doc_a).unwrap();
++    assert!(a.doc.selection.as_ref().is_some_and(|s| s.sample_channel(150, 300, 0) >= 0.5));
++}
++
+ #[test]
+ fn a_control_pointer_stroke_replies_once_committed() {
+     let mut app = quick_app();
+@@ -287,8 +402,16 @@ fn a_document_edited_under_a_drag_rebases_the_stroke() {
+             }
+         }
+         assert!(preview(&app).is_some_and(|s| s.sample_channel(1320, 40, 0) >= 0.5), "the preview grows on top of the rectangle");
+-        // ⌘D while the button is still down: no stroke is waiting, so it runs at once.
++        // ⌘D while the button is still down: no stroke is being committed, so it runs at once.
++        let grown = app.quick.regions_grown.load(std::sync::atomic::Ordering::Relaxed);
+         app.run("select.deselect", json!({})).unwrap();
++        if threaded {
++            pump(&mut app);
++            settle(&mut app);
++            // Only the selection changed: the regions grown so far are combined again, not regrown.
++            assert_eq!(app.quick.regions_grown.load(std::sync::atomic::Ordering::Relaxed), grown, "no region regrown");
++            assert!(preview(&app).is_some_and(|s| s.sample_channel(1320, 40, 0) < 0.5 && s.sample_channel(140, 300, 0) >= 0.5));
++        }
+         for k in 5..=8 {
+             drag(&mut app, 100.0 + 40.0 * f64::from(k), 300.0, Modifiers::NONE);
+             if threaded {
+@@ -330,6 +453,24 @@ fn a_failing_worker_ends_the_stroke_with_an_error() {
+     assert_eq!(doc_selection(&app), None);
+ }
+ 
++#[test]
++fn a_failure_on_a_base_the_stroke_has_left_is_ignored() {
++    // Review of #9145: a worker failing on the old base marked the rebased stroke failed.
++    let mut app = quick_app();
++    let src = QuickSource::new(&app.session, &settings(&app)).unwrap();
++    let mut live = QuickLive::new(app.session.active().unwrap().doc.id, settings(&app));
++    live.start(src.clone());
++    live.start(src);
++    assert_eq!(live.generation, 1);
++    let (worker, back) = Worker::detached();
++    live.worker = Some(worker);
++    back.send(Back::Failed { generation: 0 }).unwrap();
++    assert!(matches!(live.collect(false), Ok(None)), "the old base's failure is dropped");
++    back.send(Back::Failed { generation: 1 }).unwrap();
++    assert!(live.collect(false).is_err(), "the current base's ends the stroke");
++    app.quick.strokes.clear();
++}
++
+ #[test]
+ fn the_web_throttle_grows_at_most_a_third_of_the_time() {
+     // The web grows segments on the UI thread, timed by a frame clock that stands still within a
+diff --git a/docs/control-protocol.md b/docs/control-protocol.md
+index 61da8d9f..482595bc 100644
+--- a/docs/control-protocol.md
++++ b/docs/control-protocol.md
+@@ -215,7 +215,7 @@ The shape is pinned by a test in `crates/automation/src/rpc.rs` (#3684).
+ 
+ ### Background jobs (#210)
+ 
+-Long commands (every `filter.*`, `edit.contentAwareFill`, `edit.contentAwareScale`, `file.automate.photomerge`, `brush.presets.importAbr`), file opens and interactive saves (File › Save, Save As and the TIFF Options continuation, #2017) run as background jobs in the desktop app: the window keeps drawing, the status bar shows progress with a Cancel button, and jobs that lock the active document show a modal progress dialog (Esc cancels). `engine.execute`, `ui.menu.invoke`, `ui.dialog.confirm` and `app.save` still wait for the result by default; pass `"wait": false` to get `{job, pending: true}` at once, then poll `jobs.list` (`state`: running, done, failed, cancelled; `progress` 0–1; the result or error) and stop it with `jobs.cancel {job}`. A cancelled or failed job leaves the document unchanged. While a job runs, commands that would edit its document fail with "… is still running on this document". `ui.inspect` reports `jobs` (running jobs, opening files, saving files). Set `PHOTOCRAFT_INLINE_JOBS=1` to run everything inline.
++Long commands (every `filter.*`, `edit.contentAwareFill`, `edit.contentAwareScale`, `file.automate.photomerge`, `brush.presets.importAbr`), file opens and interactive saves (File › Save, Save As and the TIFF Options continuation, #2017) run as background jobs in the desktop app: the window keeps drawing, the status bar shows progress with a Cancel button, and jobs that lock the active document show a modal progress dialog (Esc cancels). `engine.execute`, `ui.menu.invoke`, `ui.dialog.confirm` and `app.save` still wait for the result by default; pass `"wait": false` to get `{job, pending: true}` at once, then poll `jobs.list` (`state`: running, done, failed, cancelled; `progress` 0–1; the result or error) and stop it with `jobs.cancel {job}`. A cancelled or failed job leaves the document unchanged. While a job runs, commands that would edit its document fail with "… is still running on this document". A Quick Selection stroke (a `ui.pointer` drag with the Quick Selection tool) is committed on its own document as `select.quick`; when segments are still growing at the release, that is a job named "Quick Selection" on that document (`jobs.list`, `jobs.cancel`, Esc), and `ui.pointer` replies once every stroke it released has been committed. `ui.inspect` reports `jobs` (running jobs, opening files, saving files). Set `PHOTOCRAFT_INLINE_JOBS=1` to run everything inline.
+ 
+ ## Preferences
+ 
+diff --git a/perf/budgets.toml b/perf/budgets.toml
+index f6696494..fd384b1c 100644
+--- a/perf/budgets.toml
++++ b/perf/budgets.toml
+@@ -616,16 +616,17 @@ enforce = false  # 2.8 s measured 2026-10-22
+ # ---- #9145: Quick Selection grows while you drag ----------------------------------------------
+ #
+ # The real app in an offscreen harness on a 24 MP document, pointer moves at 60 Hz in real time
+-# (segments grow on their worker meanwhile). Frames are the UI thread's work for one frame; the
+-# budget is one frame at 60 Hz. The outline should update at least ten times a second with a
+-# 30 px brush. A command that waits for a stroke's commit runs in the commit frame and costs what
+-# it costs at any time (Deselect's full refresh on 24 MP is ~200 ms on llvmpipe): not counted.
++# (segment regions grow on their worker's thread pool meanwhile). Frames are the UI thread's work
++# for one frame; the budget is one frame at 60 Hz. With a 30 px brush the outline should update
++# at least ten times a second while the pointer moves fast enough to cut that many segments (a
++# segment ends every 37.5 px of travel, so at the default 350 px/s the pointer itself allows only
++# about nine), and a stroke should be committed within half a second of its release.
+ 
+ [[bench]]
+ name = "quick_selection_bench"
+ package = "photocraft-ui-egui"
+ quick_args = ["--size", "2000x1500", "--frames", "40"]
+-note = "24 MP photo-like document, 30 px brush: drag, drag over Select All with Subtract, press and command right after a release, ⌘D mid-drag"
++note = "24 MP photo-like document, 30 px brush: drag, drag over Select All with Subtract, press and command right after a release, ⌘D mid-drag, brisk strokes (step 16 and 32)"
+ 
+ [[scenario]]
+ id = "P68"
+@@ -639,13 +640,13 @@ enforce = true
+ 
+ [[scenario]]
+ id = "P69"
+-title = "Quick Selection outline update interval while dragging, 30 px brush on 24 MP"
++title = "Quick Selection outline update interval, brisk drag (700 px/s), 30 px brush on 24 MP"
+ issue = 9145
+ bench = "quick_selection_bench"
+ row = "outline update interval"
+ metric = "p50"
+ budget_ms = 100
+-enforce = false  # 118 ms measured 2026-10-25 (4-core VM): each segment is grown with the stroke's previous segment of travel (a short drag inside an object takes it, as one stroke does), about 110 ms of segmentation on this textured test image
++enforce = true
+ 
+ [[scenario]]
+ id = "P70"
+@@ -686,3 +687,53 @@ row = "frames after a mid-drag edit"
+ metric = "max"
+ budget_ms = 16
+ enforce = true
++
++[[scenario]]
++id = "P74"
++title = "Quick Selection: commit after the release of a 350 px/s drag on 24 MP"
++issue = 9145
++bench = "quick_selection_bench"
++row = "commit after release, step 8"
++metric = "max"
++budget_ms = 500
++enforce = true
++
++[[scenario]]
++id = "P75"
++title = "Quick Selection: commit after the release of a 700 px/s drag on 24 MP"
++issue = 9145
++bench = "quick_selection_bench"
++row = "commit after release, step 16"
++metric = "max"
++budget_ms = 500
++enforce = true
++
++[[scenario]]
++id = "P76"
++title = "Quick Selection: commit after the release of a 1400 px/s drag on 24 MP"
++issue = 9145
++bench = "quick_selection_bench"
++row = "commit after release, step 32"
++metric = "max"
++budget_ms = 500
++enforce = false  # 2.1-2.3 s measured 2026-10-25 (4-core VM): 61 segments of ~190 ms of segmentation each on 3 threads take ~4 s for a 2 s stroke
++
++[[scenario]]
++id = "P77"
++title = "Quick Selection: commit after the release of a 1400 px/s drag with ⌘D mid-drag on 24 MP"
++issue = 9145
++bench = "quick_selection_bench"
++row = "commit after release, edit mid-drag at step 32"
++metric = "max"
++budget_ms = 500
++enforce = false  # 2.1-3.4 s measured 2026-10-25 (4-core VM): as P76; the regions grown before ⌘D are combined again, not regrown
++
++[[scenario]]
++id = "P78"
++title = "Quick Selection: brisk drags (700 and 1400 px/s, ⌘D mid-drag) on 24 MP (UI-thread frame)"
++issue = 9145
++bench = "quick_selection_bench"
++row = "drag frame, brisk strokes"
++metric = "max"
++budget_ms = 16
++enforce = true
