@@ -127,11 +127,83 @@ struct Grown {
     outline: Option<Traced>,
 }
 
-/// A segment growing on a worker (never on the web, which grows segments inline).
+/// Work for a stroke's worker.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-struct Job {
+enum Task {
+    /// Start (again) from `stroke` on `src`: the stroke began, or was rebased.
+    Reset { generation: u64, src: QuickSource, stroke: QuickStroke },
+    /// Grow the next segment, and trace the outline for `view`.
+    Grow { pts: Vec<(f32, f32)>, mode: SelectionMode, view: Option<OutlineView> },
+}
+
+/// A stroke's worker thread (never on the web, which grows segments inline): it grows the
+/// segments in order as they are sent, without waiting for the UI between them, and hands back
+/// the stroke after each.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct Worker {
+    #[cfg(not(target_arch = "wasm32"))]
+    tx: std::sync::mpsc::Sender<Task>,
     #[cfg(not(target_arch = "wasm32"))]
     rx: std::sync::mpsc::Receiver<Option<Grown>>,
+}
+
+/// Test hooks a worker honours: a lock it takes before each segment, and failing.
+#[cfg(test)]
+type Hooks = (Option<Arc<std::sync::RwLock<()>>>, bool);
+
+impl Worker {
+    /// Start a worker; `None` when no thread can be had (the segments then grow inline).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start(ctx: Option<egui::Context>, #[cfg(test)] hooks: Hooks) -> Option<Self> {
+        let (tx, tasks) = std::sync::mpsc::channel::<Task>();
+        let (done, rx) = std::sync::mpsc::channel::<Option<Grown>>();
+        let work = move || {
+            let mut state: Option<(u64, QuickSource, QuickStroke)> = None;
+            while let Ok(task) = tasks.recv() {
+                let (pts, mode, view) = match task {
+                    Task::Reset { generation, src, stroke } => {
+                        state = Some((generation, src, stroke));
+                        continue;
+                    }
+                    Task::Grow { pts, mode, view } => (pts, mode, view),
+                };
+                let Some((generation, src, stroke)) = state.as_mut() else { continue };
+                #[cfg(test)]
+                let _held = hooks.0.as_ref().map(|g| g.read().unwrap_or_else(std::sync::PoisonError::into_inner));
+                let mut grow = || {
+                    #[cfg(test)]
+                    if hooks.1 {
+                        std::panic::resume_unwind(Box::new("a failing worker (test)"));
+                    }
+                    stroke.push(src, &pts, mode);
+                    let bounds = bounds(stroke);
+                    let outline = view.zip(stroke.selection()).map(|(v, sel)| {
+                        let segs = crate::outline::outline_scaled(sel, bounds.intersect(&v.vis), v.step);
+                        (v.doc, crate::canvas::outline_key(sel, v.step, v.doc, v.vis, 1), Arc::new(segs))
+                    });
+                    let sel = stroke.selection().cloned().map(Arc::new);
+                    Grown { generation: *generation, stroke: stroke.clone(), sel, bounds, outline }
+                };
+                let grown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match pool() {
+                    Some(pool) => pool.install(grow),
+                    None => grow(),
+                }))
+                .ok();
+                // A failed segment leaves the stroke half-grown: grow nothing more of it.
+                if grown.is_none() {
+                    state = None;
+                }
+                if done.send(grown).is_err() {
+                    return;
+                }
+                if let Some(ctx) = &ctx {
+                    ctx.request_repaint();
+                }
+            }
+        };
+        std::thread::Builder::new().name("quick-selection".into()).spawn(work).ok()?;
+        Some(Self { tx, rx })
+    }
 }
 
 /// A Quick Selection stroke: being dragged, or released and still growing.
@@ -157,7 +229,11 @@ pub(crate) struct QuickLive {
     /// Closed segments sent to grow (done or growing), and the points they cover.
     sent: usize,
     sent_points: usize,
-    job: Option<Job>,
+    /// The worker, the base it was last told to start from, and the segments sent to it since
+    /// that have not come back.
+    worker: Option<Worker>,
+    worker_generation: Option<u64>,
+    in_flight: usize,
     /// The button is up: commit once every segment has grown.
     released: bool,
     /// A segment failed: the stroke shows nothing more and is dropped on release.
@@ -214,7 +290,9 @@ impl QuickLive {
             cutter,
             sent: 0,
             sent_points: 0,
-            job: None,
+            worker: None,
+            worker_generation: None,
+            in_flight: 0,
             released: false,
             failed: false,
             after: Vec::new(),
@@ -227,7 +305,7 @@ impl QuickLive {
     }
 
     fn busy(&self) -> bool {
-        self.job.is_some()
+        self.in_flight > 0 && !self.failed
     }
 
     /// Read the drag points not read yet, painted in `mode`, into the cut.
@@ -273,7 +351,8 @@ impl QuickLive {
         self.grown = 0;
         self.sent = 0;
         self.sent_points = 0;
-        self.job = None;
+        // Segments still growing for the old base are dropped when they come back.
+        self.in_flight = 0;
         Ok(())
     }
 
@@ -286,72 +365,69 @@ impl QuickLive {
         self.updates += 1;
     }
 
-    /// Grow `pts` in `mode` on a worker, from the stroke as shown now, and trace its outline for
-    /// `view`.
+    /// Send every closed segment not sent yet to the worker (starting it, and telling it the base,
+    /// first), its outline to be traced for `view`. False when there is no worker to be had.
     #[cfg(not(target_arch = "wasm32"))]
-    fn spawn(&mut self, pts: Vec<(f32, f32)>, mode: SelectionMode, view: Option<OutlineView>) -> bool {
-        let (src, mut stroke, ctx, generation) = (self.src.clone(), self.shown.clone(), self.ctx.clone(), self.generation);
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        #[cfg(test)]
-        let hooks = self.hooks.clone();
-        let work = move || {
+    fn send(&mut self, view: Option<OutlineView>) -> bool {
+        if self.worker.is_none() {
             #[cfg(test)]
-            let _held = hooks.0.as_ref().map(|g| g.read().unwrap_or_else(std::sync::PoisonError::into_inner));
-            let grow = move || {
-                #[cfg(test)]
-                if hooks.1 {
-                    std::panic::resume_unwind(Box::new("a failing worker (test)"));
-                }
-                stroke.push(&src, &pts, mode);
-                let bounds = bounds(&stroke);
-                let outline = view.zip(stroke.selection()).map(|(v, sel)| {
-                    let segs = crate::outline::outline_scaled(sel, bounds.intersect(&v.vis), v.step);
-                    (v.doc, crate::canvas::outline_key(sel, v.step, v.doc, v.vis, 1), Arc::new(segs))
-                });
-                let sel = stroke.selection().cloned().map(Arc::new);
-                Grown { generation, stroke, sel, bounds, outline }
-            };
-            let grown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || match pool() {
-                Some(pool) => pool.install(grow),
-                None => grow(),
-            }))
-            .ok();
-            let _ = tx.send(grown);
-            if let Some(ctx) = ctx {
-                ctx.request_repaint();
-            }
-        };
-        match std::thread::Builder::new().name("quick-selection".into()).spawn(work) {
-            Ok(_) => {
-                self.job = Some(Job { rx });
-                true
-            }
-            Err(_) => false,
+            let worker = Worker::start(self.ctx.clone(), self.hooks.clone());
+            #[cfg(not(test))]
+            let worker = Worker::start(self.ctx.clone());
+            self.worker = worker;
         }
+        let Some(tx) = self.worker.as_ref().map(|w| w.tx.clone()) else { return false };
+        if self.worker_generation != Some(self.generation) {
+            let reset = Task::Reset { generation: self.generation, src: self.src.clone(), stroke: self.shown.clone() };
+            if tx.send(reset).is_err() {
+                return false;
+            }
+            self.worker_generation = Some(self.generation);
+        }
+        while let Some((pts, mode)) = self.next() {
+            if tx.send(Task::Grow { pts, mode, view }).is_err() {
+                return false;
+            }
+            self.in_flight += 1;
+        }
+        true
     }
 
-    /// Take a finished worker's segment (`wait`: block until it is done): its traced outline, if
-    /// any. An error when the worker failed.
+    /// Take the segments the worker has grown (`wait`: block until one comes, if any is growing):
+    /// the last traced outline, if any. An error when the worker failed.
     #[cfg(not(target_arch = "wasm32"))]
     fn collect(&mut self, wait: bool) -> Result<Option<Traced>, String> {
-        let Some(job) = &self.job else { return Ok(None) };
-        let got = if wait { job.rx.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected) } else { job.rx.try_recv() };
-        let grown = match got {
-            Ok(g) => g,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(None),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
-        };
-        self.job = None;
-        let grown = grown.ok_or_else(|| tl!("Quick Selection failed with an internal error; the selection is unchanged").to_string())?;
-        if grown.generation != self.generation {
-            return Ok(None);
+        let failed = || tl!("Quick Selection failed with an internal error; the selection is unchanged").to_string();
+        let Some(worker) = &self.worker else { return Ok(None) };
+        let mut outline = None;
+        let mut block = wait && self.in_flight > 0;
+        loop {
+            let got = if block { worker.rx.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected) } else { worker.rx.try_recv() };
+            block = false;
+            let grown = match got {
+                Ok(Some(g)) => g,
+                // The worker grows nothing more of this stroke.
+                Ok(None) => {
+                    self.in_flight = 0;
+                    return Err(failed());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(outline),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let lost = std::mem::take(&mut self.in_flight) > 0;
+                    return if lost { Err(failed()) } else { Ok(outline) };
+                }
+            };
+            if grown.generation != self.generation {
+                continue;
+            }
+            self.in_flight = self.in_flight.saturating_sub(1);
+            self.shown_bounds = grown.bounds;
+            self.shown_sel = grown.sel;
+            self.shown = grown.stroke;
+            self.grown += 1;
+            self.updates += 1;
+            outline = grown.outline.or(outline);
         }
-        self.shown_bounds = grown.bounds;
-        self.shown_sel = grown.sel;
-        self.shown = grown.stroke;
-        self.grown += 1;
-        self.updates += 1;
-        Ok(grown.outline)
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -466,12 +542,16 @@ fn step(app: &mut PhotocraftApp) -> bool {
         _ => return false,
     }
     let view = view.filter(|v| v.doc == front.doc);
-    while !front.busy() {
-        if cfg!(target_arch = "wasm32") && !front.throttle.ready(now) {
-            break;
-        }
-        let Some((pts, mode)) = front.next() else { break };
-        if inline {
+    // The desktop sends every closed segment to the worker at once; it grows them in order.
+    #[cfg(not(target_arch = "wasm32"))]
+    let inline = inline || !front.send(view);
+    let _ = view;
+    if inline {
+        loop {
+            if cfg!(target_arch = "wasm32") && !front.throttle.ready(now) {
+                break;
+            }
+            let Some((pts, mode)) = front.next() else { break };
             #[cfg(test)]
             if app.background_jobs {
                 app.quick.inline_grows += 1;
@@ -481,19 +561,8 @@ fn step(app: &mut PhotocraftApp) -> bool {
                 front.throttle.grew(now);
                 break;
             }
-            continue;
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        if !front.spawn(pts.clone(), mode, view) {
-            // No thread to be had: grow it here rather than lose it.
-            #[cfg(test)]
-            {
-                app.quick.inline_grows += 1;
-            }
-            front.grow_inline(&pts, mode);
         }
     }
-    let _ = view;
     if front.released && front.caught_up() {
         commit_front(app);
         return true;
@@ -642,13 +711,10 @@ pub fn idle(app: &PhotocraftApp) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn settle(app: &mut PhotocraftApp) {
     for _ in 0..100_000 {
+        pump(app);
         let Some(front) = app.quick.strokes.first_mut() else { return };
         if !front.busy() {
-            pump(app);
-            if app.quick.strokes.first().is_none_or(|f| !f.busy()) {
-                return;
-            }
-            continue;
+            return;
         }
         match front.collect(true) {
             Ok(Some(outline)) => app.outline_cache = Some(outline),
@@ -659,7 +725,6 @@ pub fn settle(app: &mut PhotocraftApp) {
                 app.ui.status_error = true;
             }
         }
-        pump(app);
     }
 }
 
